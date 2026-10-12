@@ -81,6 +81,51 @@ app.get('/api/friends', authenticateToken, async (req, res) => {
     }
 });
 
+app.get('/api/friends/requests', authenticateToken, async (req, res) => {
+    try {
+        const requests = await db.getFriendRequests(req.user.id);
+        res.json(requests);
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+app.post('/api/friends/request', authenticateToken, async (req, res) => {
+    try {
+        const result = await db.sendFriendRequest(req.user.id, req.body.username);
+        res.json(result);
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+app.post('/api/friends/accept', authenticateToken, async (req, res) => {
+    try {
+        const result = await db.acceptFriendRequest(req.user.id, req.body.targetId);
+        res.json(result);
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+app.post('/api/friends/decline', authenticateToken, async (req, res) => {
+    try {
+        const result = await db.declineFriendRequest(req.user.id, req.body.targetId);
+        res.json(result);
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+app.post('/api/friends/cancel', authenticateToken, async (req, res) => {
+    try {
+        const result = await db.cancelFriendRequest(req.user.id, req.body.targetId);
+        res.json(result);
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
 app.post('/api/friends/add', authenticateToken, async (req, res) => {
     try {
         const friend = await db.addFriend(req.user.id, req.body.username);
@@ -94,6 +139,44 @@ app.delete('/api/friends/:id', authenticateToken, async (req, res) => {
     try {
         await db.removeFriend(req.user.id, req.params.id);
         res.json({ success: true });
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+// --- Profile Routes ---
+app.get('/api/profile', authenticateToken, async (req, res) => {
+    try {
+        const profile = await db.getProfile(req.user.id);
+        res.json(profile);
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+app.post('/api/profile', authenticateToken, async (req, res) => {
+    try {
+        const updated = await db.saveProfile(req.user.id, req.body);
+        res.json(updated);
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+// --- Direct Messages Routes ---
+app.get('/api/dm/:targetUser', authenticateToken, async (req, res) => {
+    try {
+        const messages = await db.getDirectMessages(req.user.username, req.params.targetUser);
+        res.json(messages);
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+app.post('/api/dm/:targetUser', authenticateToken, async (req, res) => {
+    try {
+        const msg = await db.addDirectMessage(req.user.username, req.params.targetUser, req.body.msg, req.body.isMedia);
+        res.json(msg);
     } catch (e) {
         res.status(400).json({ error: e.message });
     }
@@ -336,11 +419,18 @@ io.on('connection', async (socket) => {
         io.emit('online-users', Object.values(onlineUsers));
     });
 
-    socket.on('private-message', (toUser, msg, fromName) => {
+    socket.on('private-message', async (toUser, msg, fromName, isMedia = false) => {
+        const timestamp = Date.now();
+        try {
+            await db.addDirectMessage(fromName, toUser, msg, isMedia);
+        } catch (e) {
+            console.error('[DM] Save failed:', e.message);
+        }
         const toSocket = userSockets[toUser];
         if (toSocket) {
-            io.to(toSocket).emit('private-message', fromName, msg, new Date().toLocaleTimeString());
+            io.to(toSocket).emit('private-message', fromName, msg, timestamp, isMedia);
         }
+        socket.emit('private-message-sent', toUser, msg, timestamp, isMedia);
     });
 
     // 3. Voice & Room Channel Management:

@@ -29,12 +29,16 @@ const dataDir = path.join(__dirname, 'data');
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
 const usersFile = path.join(dataDir, 'users.json');
 const serversFile = path.join(dataDir, 'virtual_servers.json');
+const dmsFile = path.join(dataDir, 'direct_messages.json');
 
 if (!fs.existsSync(usersFile)) {
     fs.writeFileSync(usersFile, JSON.stringify([], null, 2));
 }
 if (!fs.existsSync(serversFile)) {
     fs.writeFileSync(serversFile, JSON.stringify({}, null, 2));
+}
+if (!fs.existsSync(dmsFile)) {
+    fs.writeFileSync(dmsFile, JSON.stringify([], null, 2));
 }
 
 // Initialize PostgreSQL tables if pool is active
@@ -48,9 +52,20 @@ async function initPgTables() {
                 username TEXT UNIQUE,
                 password TEXT,
                 friends JSONB DEFAULT '[]'::jsonb,
+                requests_in JSONB DEFAULT '[]'::jsonb,
+                requests_out JSONB DEFAULT '[]'::jsonb,
+                bio TEXT DEFAULT '',
+                avatar TEXT DEFAULT '',
+                ring_color TEXT DEFAULT '#00ff00',
                 settings JSONB DEFAULT '{}'::jsonb,
                 servers JSONB DEFAULT '[]'::jsonb
             );
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS requests_in JSONB DEFAULT '[]'::jsonb;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS requests_out JSONB DEFAULT '[]'::jsonb;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT '';
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT DEFAULT '';
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS ring_color TEXT DEFAULT '#00ff00';
+
             CREATE TABLE IF NOT EXISTS virtual_servers (
                 id TEXT PRIMARY KEY,
                 data JSONB
@@ -65,6 +80,16 @@ async function initPgTables() {
                 ts BIGINT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_messages_room ON messages (server_id, room, ts);
+
+            CREATE TABLE IF NOT EXISTS direct_messages (
+                id SERIAL PRIMARY KEY,
+                sender TEXT NOT NULL,
+                receiver TEXT NOT NULL,
+                msg TEXT,
+                is_media BOOLEAN DEFAULT false,
+                ts BIGINT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_dm_pair ON direct_messages (sender, receiver, ts);
         `);
         console.log('[DB] PostgreSQL tables ready');
     } catch (e) {
@@ -107,6 +132,20 @@ function saveLocalVirtualServers(data) {
     const tmp = serversFile + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
     fs.renameSync(tmp, serversFile);
+}
+
+function getLocalDMs() {
+    try {
+        return JSON.parse(fs.readFileSync(dmsFile, 'utf8'));
+    } catch (e) {
+        return [];
+    }
+}
+
+function saveLocalDMs(data) {
+    const tmp = dmsFile + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+    fs.renameSync(tmp, dmsFile);
 }
 
 const vsCache = {};
@@ -187,47 +226,168 @@ module.exports = {
     },
 
     addFriend: async (userId, friendUsername) => {
-        if (!friendUsername) throw new Error('Ungültiger Name');
-        friendUsername = friendUsername.trim();
+        return await module.exports.sendFriendRequest(userId, friendUsername);
+    },
+
+    sendFriendRequest: async (userId, targetUsername) => {
+        if (!targetUsername) throw new Error('Benutzername erforderlich.');
+        targetUsername = targetUsername.trim();
 
         if (pgPool) {
             const uRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [userId]);
-            const fRes = await pgPool.query('SELECT * FROM users WHERE LOWER(username) = LOWER($1)', [friendUsername]);
+            const tRes = await pgPool.query('SELECT * FROM users WHERE LOWER(username) = LOWER($1)', [targetUsername]);
             const user = uRes.rows[0];
-            const friend = fRes.rows[0];
+            const target = tRes.rows[0];
 
-            if (!user) throw new Error('User nicht gefunden');
-            if (!friend) throw new Error('Freund existiert nicht');
-            if (user.id === friend.id) throw new Error('Du kannst dich nicht selbst adden');
+            if (!user) throw new Error('Nutzer nicht gefunden.');
+            if (!target) throw new Error('Nutzer "' + targetUsername + '" existiert nicht.');
+            if (user.id === target.id) throw new Error('Du kannst dir nicht selbst eine Anfrage senden.');
 
             const uFriends = Array.isArray(user.friends) ? user.friends : [];
-            const fFriends = Array.isArray(friend.friends) ? friend.friends : [];
+            if (uFriends.includes(target.id)) throw new Error('Ihr seid bereits befreundet.');
 
-            if (uFriends.includes(friend.id)) throw new Error('Bereits befreundet');
-            uFriends.push(friend.id);
-            if (!fFriends.includes(user.id)) fFriends.push(user.id);
+            const uOut = Array.isArray(user.requests_out) ? user.requests_out : [];
+            const tIn = Array.isArray(target.requests_in) ? target.requests_in : [];
 
-            await pgPool.query('UPDATE users SET friends = $1 WHERE id = $2', [JSON.stringify(uFriends), user.id]);
-            await pgPool.query('UPDATE users SET friends = $1 WHERE id = $2', [JSON.stringify(fFriends), friend.id]);
-            return { id: friend.id, username: friend.username };
+            if (uOut.some(r => r.id === target.id)) throw new Error('Anfrage bereits gesendet.');
+
+            const uIn = Array.isArray(user.requests_in) ? user.requests_in : [];
+            if (uIn.some(r => r.id === target.id)) {
+                return await module.exports.acceptFriendRequest(userId, target.id);
+            }
+
+            uOut.push({ id: target.id, username: target.username, ts: Date.now() });
+            tIn.push({ id: user.id, username: user.username, ts: Date.now() });
+
+            await pgPool.query('UPDATE users SET requests_out = $1 WHERE id = $2', [JSON.stringify(uOut), user.id]);
+            await pgPool.query('UPDATE users SET requests_in = $1 WHERE id = $2', [JSON.stringify(tIn), target.id]);
+            return { success: true, targetId: target.id, targetUsername: target.username };
         } else {
             const users = getLocalUsers();
             const user = users.find(u => u.id === userId);
-            const friend = users.find(u => u.username.toLowerCase() === friendUsername.toLowerCase());
+            const target = users.find(u => u.username.toLowerCase() === targetUsername.toLowerCase());
 
-            if (!user) throw new Error('User nicht gefunden');
-            if (!friend) throw new Error('Freund existiert nicht');
-            if (user.id === friend.id) throw new Error('Du kannst dich nicht selbst adden');
+            if (!user) throw new Error('Nutzer nicht gefunden.');
+            if (!target) throw new Error('Nutzer "' + targetUsername + '" existiert nicht.');
+            if (user.id === target.id) throw new Error('Du kannst dir nicht selbst eine Anfrage senden.');
 
             if (!user.friends) user.friends = [];
-            if (user.friends.includes(friend.id)) throw new Error('Bereits befreundet');
-            user.friends.push(friend.id);
+            if (user.friends.includes(target.id)) throw new Error('Ihr seid bereits befreundet.');
 
-            if (!friend.friends) friend.friends = [];
-            if (!friend.friends.includes(user.id)) friend.friends.push(user.id);
+            if (!user.requestsOut) user.requestsOut = [];
+            if (!target.requestsIn) target.requestsIn = [];
+
+            if (user.requestsOut.some(r => r.id === target.id)) throw new Error('Anfrage bereits gesendet.');
+
+            user.requestsOut.push({ id: target.id, username: target.username, ts: Date.now() });
+            target.requestsIn.push({ id: user.id, username: user.username, ts: Date.now() });
 
             saveLocalUsers(users);
-            return { id: friend.id, username: friend.username };
+            return { success: true, targetId: target.id, targetUsername: target.username };
+        }
+    },
+
+    getFriendRequests: async (userId) => {
+        if (pgPool) {
+            const res = await pgPool.query('SELECT requests_in, requests_out FROM users WHERE id = $1', [userId]);
+            const row = res.rows[0];
+            return {
+                incoming: (row && Array.isArray(row.requests_in)) ? row.requests_in : [],
+                outgoing: (row && Array.isArray(row.requests_out)) ? row.requests_out : []
+            };
+        } else {
+            const users = getLocalUsers();
+            const user = users.find(u => u.id === userId);
+            return {
+                incoming: (user && user.requestsIn) || [],
+                outgoing: (user && user.requestsOut) || []
+            };
+        }
+    },
+
+    acceptFriendRequest: async (userId, targetId) => {
+        if (pgPool) {
+            const uRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [userId]);
+            const tRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [targetId]);
+            const user = uRes.rows[0];
+            const target = tRes.rows[0];
+            if (!user || !target) throw new Error('Nutzer nicht gefunden.');
+
+            const uIn = (user.requests_in || []).filter(r => r.id !== targetId);
+            const tOut = (target.requests_out || []).filter(r => r.id !== userId);
+
+            const uFriends = Array.isArray(user.friends) ? user.friends : [];
+            const tFriends = Array.isArray(target.friends) ? target.friends : [];
+            if (!uFriends.includes(targetId)) uFriends.push(targetId);
+            if (!tFriends.includes(userId)) tFriends.push(userId);
+
+            await pgPool.query('UPDATE users SET requests_in = $1, friends = $2 WHERE id = $3', [JSON.stringify(uIn), JSON.stringify(uFriends), userId]);
+            await pgPool.query('UPDATE users SET requests_out = $1, friends = $2 WHERE id = $3', [JSON.stringify(tOut), JSON.stringify(tFriends), targetId]);
+            return { success: true, friend: { id: target.id, username: target.username } };
+        } else {
+            const users = getLocalUsers();
+            const user = users.find(u => u.id === userId);
+            const target = users.find(u => u.id === targetId);
+            if (!user || !target) throw new Error('Nutzer nicht gefunden.');
+
+            user.requestsIn = (user.requestsIn || []).filter(r => r.id !== targetId);
+            target.requestsOut = (target.requestsOut || []).filter(r => r.id !== userId);
+
+            if (!user.friends) user.friends = [];
+            if (!target.friends) target.friends = [];
+            if (!user.friends.includes(targetId)) user.friends.push(targetId);
+            if (!target.friends.includes(userId)) target.friends.push(userId);
+
+            saveLocalUsers(users);
+            return { success: true, friend: { id: target.id, username: target.username } };
+        }
+    },
+
+    declineFriendRequest: async (userId, targetId) => {
+        if (pgPool) {
+            const uRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [userId]);
+            const tRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [targetId]);
+            if (uRes.rows[0]) {
+                const uIn = (uRes.rows[0].requests_in || []).filter(r => r.id !== targetId);
+                await pgPool.query('UPDATE users SET requests_in = $1 WHERE id = $2', [JSON.stringify(uIn), userId]);
+            }
+            if (tRes.rows[0]) {
+                const tOut = (tRes.rows[0].requests_out || []).filter(r => r.id !== userId);
+                await pgPool.query('UPDATE users SET requests_out = $1 WHERE id = $2', [JSON.stringify(tOut), targetId]);
+            }
+            return { success: true };
+        } else {
+            const users = getLocalUsers();
+            const user = users.find(u => u.id === userId);
+            const target = users.find(u => u.id === targetId);
+            if (user) user.requestsIn = (user.requestsIn || []).filter(r => r.id !== targetId);
+            if (target) target.requestsOut = (target.requestsOut || []).filter(r => r.id !== userId);
+            saveLocalUsers(users);
+            return { success: true };
+        }
+    },
+
+    cancelFriendRequest: async (userId, targetId) => {
+        if (pgPool) {
+            const uRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [userId]);
+            const tRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [targetId]);
+            if (uRes.rows[0]) {
+                const uOut = (uRes.rows[0].requests_out || []).filter(r => r.id !== targetId);
+                await pgPool.query('UPDATE users SET requests_out = $1 WHERE id = $2', [JSON.stringify(uOut), userId]);
+            }
+            if (tRes.rows[0]) {
+                const tIn = (tRes.rows[0].requests_in || []).filter(r => r.id !== userId);
+                await pgPool.query('UPDATE users SET requests_in = $1 WHERE id = $2', [JSON.stringify(tIn), targetId]);
+            }
+            return { success: true };
+        } else {
+            const users = getLocalUsers();
+            const user = users.find(u => u.id === userId);
+            const target = users.find(u => u.id === targetId);
+            if (user) user.requestsOut = (user.requestsOut || []).filter(r => r.id !== targetId);
+            if (target) target.requestsIn = (target.requestsIn || []).filter(r => r.id !== userId);
+            saveLocalUsers(users);
+            return { success: true };
         }
     },
 
@@ -258,14 +418,86 @@ module.exports = {
             const res = await pgPool.query('SELECT friends FROM users WHERE id = $1', [userId]);
             const friendIds = res.rows[0]?.friends || [];
             if (!friendIds.length) return [];
-            const friendsRes = await pgPool.query('SELECT id, username FROM users WHERE id = ANY($1)', [friendIds]);
-            return friendsRes.rows;
+            const friendsRes = await pgPool.query('SELECT id, username, bio, avatar, ring_color FROM users WHERE id = ANY($1)', [friendIds]);
+            return friendsRes.rows.map(r => ({
+                id: r.id,
+                username: r.username,
+                bio: r.bio || '',
+                avatar: r.avatar || '',
+                ringColor: r.ring_color || '#00ff00'
+            }));
         } else {
             const users = getLocalUsers();
             const user = users.find(u => u.id === userId);
             if (!user || !user.friends) return [];
-            return users.filter(u => user.friends.includes(u.id)).map(u => ({ id: u.id, username: u.username }));
+            return users.filter(u => user.friends.includes(u.id)).map(u => ({
+                id: u.id,
+                username: u.username,
+                bio: u.bio || '',
+                avatar: u.avatar || '',
+                ringColor: u.ringColor || '#00ff00'
+            }));
         }
+    },
+
+    getProfile: async (userId) => {
+        if (pgPool) {
+            const res = await pgPool.query('SELECT id, username, bio, avatar, ring_color FROM users WHERE id = $1', [userId]);
+            const row = res.rows[0];
+            if (!row) throw new Error('Nutzer nicht gefunden');
+            return { id: row.id, username: row.username, bio: row.bio || '', avatar: row.avatar || '', ringColor: row.ring_color || '#00ff00' };
+        }
+        const user = getLocalUsers().find(u => u.id === userId);
+        if (!user) throw new Error('Nutzer nicht gefunden');
+        return { id: user.id, username: user.username, bio: user.bio || '', avatar: user.avatar || '', ringColor: user.ringColor || '#00ff00' };
+    },
+
+    saveProfile: async (userId, data) => {
+        const bio = typeof data.bio === 'string' ? data.bio.slice(0, 255) : '';
+        const avatar = typeof data.avatar === 'string' ? data.avatar : '';
+        const ringColor = typeof data.ringColor === 'string' ? data.ringColor : '#00ff00';
+
+        if (pgPool) {
+            await pgPool.query('UPDATE users SET bio = $1, avatar = $2, ring_color = $3 WHERE id = $4', [bio, avatar, ringColor, userId]);
+            return { bio, avatar, ringColor };
+        }
+        const users = getLocalUsers();
+        const user = users.find(u => u.id === userId);
+        if (user) {
+            user.bio = bio;
+            user.avatar = avatar;
+            user.ringColor = ringColor;
+            saveLocalUsers(users);
+        }
+        return { bio, avatar, ringColor };
+    },
+
+    addDirectMessage: async (sender, receiver, msg, isMedia = false) => {
+        const ts = Date.now();
+        if (pgPool) {
+            await pgPool.query('INSERT INTO direct_messages (sender, receiver, msg, is_media, ts) VALUES ($1, $2, $3, $4, $5)',
+                [sender, receiver, msg, !!isMedia, ts]);
+        } else {
+            const dms = getLocalDMs();
+            dms.push({ sender, receiver, msg, isMedia: !!isMedia, ts });
+            if (dms.length > 2000) dms.splice(0, dms.length - 2000);
+            saveLocalDMs(dms);
+        }
+        return { sender, receiver, msg, isMedia, ts };
+    },
+
+    getDirectMessages: async (userA, userB) => {
+        if (pgPool) {
+            const res = await pgPool.query(
+                'SELECT sender, receiver, msg, is_media, ts FROM direct_messages WHERE (sender = $1 AND receiver = $2) OR (sender = $2 AND receiver = $1) ORDER BY ts ASC LIMIT 300',
+                [userA, userB]
+            );
+            return res.rows.map(r => ({ sender: r.sender, receiver: r.receiver, text: r.msg, isMedia: r.is_media, time: Number(r.ts) }));
+        }
+        const dms = getLocalDMs();
+        return dms.filter(m => (m.sender === userA && m.receiver === userB) || (m.sender === userB && m.receiver === userA))
+            .slice(-300)
+            .map(m => ({ sender: m.sender, receiver: m.receiver, text: m.msg, isMedia: m.isMedia, time: m.ts }));
     },
 
     getSettings: async (userId) => {
