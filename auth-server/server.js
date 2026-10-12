@@ -314,6 +314,28 @@ app.delete('/api/channels/:name', async (req, res) => {
     res.status(403).json({ error: 'Insufficient power level to delete channel' });
 });
 
+app.post('/api/channels/reorder', async (req, res) => {
+    try {
+        const { serverId = 'default', channels, requestingUser } = req.body;
+        if (!Array.isArray(channels)) return res.status(400).json({ error: 'Kanäle Array erforderlich' });
+        const srv = await db.getVirtualServer(serverId);
+        if (!srv) return res.status(404).json({ error: 'Server nicht gefunden' });
+
+        const reqRole = (srv.userGroups && srv.userGroups[requestingUser]) || srv.settings?.defaultRole || 'user';
+        const reqPower = powerMap[reqRole] || 0;
+
+        if (reqPower >= 75 || !requestingUser) {
+            srv.channels = channels;
+            await db.saveVirtualServer(serverId, srv);
+            io.to(serverId).emit('channels-update', srv.channels);
+            return res.json({ success: true, channels: srv.channels });
+        }
+        res.status(403).json({ error: 'Unzureichende Berechtigung zum Umordnen von Kanälen' });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // --- Messages ---
 app.get('/api/messages/:room', async (req, res) => {
     const serverId = req.query.serverId || 'default';
@@ -519,6 +541,20 @@ io.on('connection', async (socket) => {
             }
         }
         io.to(currentSid).emit('user-stream-updated', { username: uName, isStreaming: !!isStreaming });
+    });
+
+    socket.on('user-voice-state', ({ isMuted, isDeafened, username: explicitUser }) => {
+        const currentSid = serverId || 'default';
+        const uName = explicitUser || username || onlineUsers[socket.id];
+        for (const roomKey in rooms) {
+            if (rooms[roomKey][socket.id]) {
+                rooms[roomKey][socket.id].isMuted = !!isMuted;
+                rooms[roomKey][socket.id].isDeafened = !!isDeafened;
+                const rId = roomKey.replace(currentSid + '_', '');
+                io.to(currentSid).emit('room-users-update', rId, Object.values(rooms[roomKey]));
+            }
+        }
+        io.to(currentSid).emit('user-voice-state-updated', { username: uName, isMuted: !!isMuted, isDeafened: !!isDeafened });
     });
 
     socket.on('chat-message', async (roomId, msg, name, isMedia) => {
