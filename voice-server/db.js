@@ -7,15 +7,9 @@ let pgPool = null;
 if (process.env.DATABASE_URL) {
     try {
         const { Pool } = require('pg');
-        let connStr = process.env.DATABASE_URL;
-        // Fix for pg security warning regarding SSL modes:
-        // Explicitly use sslmode=verify-full or disable if localhost
-        if (connStr.includes('sslmode=') && !connStr.includes('uselibpqcompat')) {
-            connStr = connStr.replace(/sslmode=(require|prefer|verify-ca)/g, 'sslmode=verify-full');
-        }
         pgPool = new Pool({
-            connectionString: connStr,
-            ssl: connStr.includes('localhost') ? false : { rejectUnauthorized: false }
+            connectionString: process.env.DATABASE_URL,
+            ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }
         });
         console.log('[DB] PostgreSQL configured via DATABASE_URL');
     } catch (e) {

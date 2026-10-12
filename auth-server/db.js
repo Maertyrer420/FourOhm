@@ -207,6 +207,37 @@ module.exports = {
         return user;
     },
 
+    changePassword: async (userId, oldPassword, newPassword) => {
+        if (!oldPassword || !newPassword) throw new Error('Altes und neues Passwort erforderlich.');
+        if (newPassword.length < 4) throw new Error('Neues Passwort muss mindestens 4 Zeichen lang sein.');
+        
+        let user = null;
+        if (pgPool) {
+            const res = await pgPool.query('SELECT * FROM users WHERE id = $1', [userId]);
+            user = res.rows[0];
+        } else {
+            const users = getLocalUsers();
+            user = users.find(u => u.id === userId);
+        }
+
+        if (!user) throw new Error('Benutzer nicht gefunden.');
+        const isValid = bcrypt.compareSync(oldPassword, user.password);
+        if (!isValid) throw new Error('Altes Passwort ist inkorrekt.');
+
+        const hashedPassword = bcrypt.hashSync(newPassword, 8);
+        if (pgPool) {
+            await pgPool.query('UPDATE users SET password = $1 WHERE id = $2', [hashedPassword, userId]);
+        } else {
+            const users = getLocalUsers();
+            const u = users.find(u => u.id === userId);
+            if (u) {
+                u.password = hashedPassword;
+                saveLocalUsers(users);
+            }
+        }
+        return { success: true, message: 'Passwort erfolgreich geändert.' };
+    },
+
     getUserById: async (id) => {
         if (pgPool) {
             const res = await pgPool.query('SELECT * FROM users WHERE id = $1', [id]);
@@ -230,8 +261,11 @@ module.exports = {
     },
 
     sendFriendRequest: async (userId, targetUsername) => {
+        if (typeof targetUsername === 'object' && targetUsername !== null) {
+            targetUsername = targetUsername.username || targetUsername.id;
+        }
         if (!targetUsername) throw new Error('Benutzername erforderlich.');
-        targetUsername = targetUsername.trim();
+        targetUsername = String(targetUsername).trim();
 
         if (pgPool) {
             const uRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [userId]);
@@ -306,7 +340,11 @@ module.exports = {
     },
 
     acceptFriendRequest: async (userId, targetIdentifier) => {
+        if (typeof targetIdentifier === 'object' && targetIdentifier !== null) {
+            targetIdentifier = targetIdentifier.username || targetIdentifier.id;
+        }
         if (!targetIdentifier) throw new Error('Ziel-Nutzer erforderlich.');
+        targetIdentifier = String(targetIdentifier).trim();
         if (pgPool) {
             const uRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [userId]);
             const user = uRes.rows[0];
@@ -353,7 +391,11 @@ module.exports = {
     },
 
     declineFriendRequest: async (userId, targetIdentifier) => {
+        if (typeof targetIdentifier === 'object' && targetIdentifier !== null) {
+            targetIdentifier = targetIdentifier.username || targetIdentifier.id;
+        }
         if (!targetIdentifier) throw new Error('Ziel-Nutzer erforderlich.');
+        targetIdentifier = String(targetIdentifier).trim();
         if (pgPool) {
             const uRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [userId]);
             let tRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [targetIdentifier]);
@@ -386,7 +428,11 @@ module.exports = {
     },
 
     cancelFriendRequest: async (userId, targetIdentifier) => {
+        if (typeof targetIdentifier === 'object' && targetIdentifier !== null) {
+            targetIdentifier = targetIdentifier.username || targetIdentifier.id;
+        }
         if (!targetIdentifier) throw new Error('Ziel-Nutzer erforderlich.');
+        targetIdentifier = String(targetIdentifier).trim();
         if (pgPool) {
             const uRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [userId]);
             let tRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [targetIdentifier]);

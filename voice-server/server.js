@@ -158,8 +158,11 @@ app.post('/api/moderate', async (req, res) => {
     const reqRole = srv.userGroups[requestingUser] || srv.settings?.defaultRole || 'user';
     const reqPower = powerMap[reqRole] || 0;
 
+    srv.banned = srv.banned || [];
+    srv.serverMuted = srv.serverMuted || [];
+    srv.chatRestricted = srv.chatRestricted || [];
+
     if (action === 'ban' && reqPower >= 75) {
-        srv.banned = srv.banned || [];
         if (!srv.banned.includes(targetUser)) srv.banned.push(targetUser);
         await db.saveVirtualServer(serverId, srv);
         io.to(serverId).emit('user-banned', targetUser);
@@ -170,14 +173,94 @@ app.post('/api/moderate', async (req, res) => {
         return res.json({ success: true });
     }
     if (action === 'mute' && reqPower >= 50) {
+        if (!srv.serverMuted.includes(targetUser)) srv.serverMuted.push(targetUser);
+        await db.saveVirtualServer(serverId, srv);
         io.to(serverId).emit('user-server-muted', targetUser);
         return res.json({ success: true });
     }
     if (action === 'chat-restrict' && reqPower >= 50) {
+        if (!srv.chatRestricted.includes(targetUser)) srv.chatRestricted.push(targetUser);
+        await db.saveVirtualServer(serverId, srv);
         io.to(serverId).emit('user-chat-restricted', targetUser);
         return res.json({ success: true });
     }
     return res.status(403).json({ error: 'Insufficient power or invalid action' });
+});
+
+app.get('/api/moderation/lists', async (req, res) => {
+    try {
+        const serverId = req.query.serverId || 'default';
+        const srv = await db.getVirtualServer(serverId);
+        res.json({
+            banned: srv.banned || [],
+            serverMuted: srv.serverMuted || [],
+            chatRestricted: srv.chatRestricted || []
+        });
+    } catch(e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+app.post('/api/moderation/revoke', async (req, res) => {
+    try {
+        const { serverId = 'default', targetUser, type, requestingUser } = req.body;
+        const srv = await db.getVirtualServer(serverId);
+        const reqRole = srv.userGroups[requestingUser] || srv.settings?.defaultRole || 'user';
+        const reqPower = powerMap[reqRole] || 0;
+
+        if (type === 'ban') {
+            if (reqPower < 75) return res.status(403).json({ error: 'Keine Berechtigung' });
+            srv.banned = (srv.banned || []).filter(u => u !== targetUser);
+            await db.saveVirtualServer(serverId, srv);
+            io.to(serverId).emit('user-unbanned', targetUser);
+        } else if (type === 'mute') {
+            if (reqPower < 50) return res.status(403).json({ error: 'Keine Berechtigung' });
+            srv.serverMuted = (srv.serverMuted || []).filter(u => u !== targetUser);
+            await db.saveVirtualServer(serverId, srv);
+            io.to(serverId).emit('user-server-unmuted', targetUser);
+        } else if (type === 'chat-restrict') {
+            if (reqPower < 50) return res.status(403).json({ error: 'Keine Berechtigung' });
+            srv.chatRestricted = (srv.chatRestricted || []).filter(u => u !== targetUser);
+            await db.saveVirtualServer(serverId, srv);
+            io.to(serverId).emit('user-chat-unrestricted', targetUser);
+        }
+        res.json({ success: true });
+    } catch(e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+app.post('/api/moderation/add', async (req, res) => {
+    try {
+        const { serverId = 'default', targetUser, type, requestingUser } = req.body;
+        if (!targetUser) return res.status(400).json({ error: 'Benutzer erforderlich' });
+        const srv = await db.getVirtualServer(serverId);
+        const reqRole = srv.userGroups[requestingUser] || srv.settings?.defaultRole || 'user';
+        const reqPower = powerMap[reqRole] || 0;
+
+        if (type === 'ban') {
+            if (reqPower < 75) return res.status(403).json({ error: 'Keine Berechtigung' });
+            srv.banned = srv.banned || [];
+            if (!srv.banned.includes(targetUser)) srv.banned.push(targetUser);
+            await db.saveVirtualServer(serverId, srv);
+            io.to(serverId).emit('user-banned', targetUser);
+        } else if (type === 'mute') {
+            if (reqPower < 50) return res.status(403).json({ error: 'Keine Berechtigung' });
+            srv.serverMuted = srv.serverMuted || [];
+            if (!srv.serverMuted.includes(targetUser)) srv.serverMuted.push(targetUser);
+            await db.saveVirtualServer(serverId, srv);
+            io.to(serverId).emit('user-server-muted', targetUser);
+        } else if (type === 'chat-restrict') {
+            if (reqPower < 50) return res.status(403).json({ error: 'Keine Berechtigung' });
+            srv.chatRestricted = srv.chatRestricted || [];
+            if (!srv.chatRestricted.includes(targetUser)) srv.chatRestricted.push(targetUser);
+            await db.saveVirtualServer(serverId, srv);
+            io.to(serverId).emit('user-chat-restricted', targetUser);
+        }
+        res.json({ success: true });
+    } catch(e) {
+        res.status(400).json({ error: e.message });
+    }
 });
 
 // Sockets & WebRTC
@@ -274,6 +357,20 @@ io.on('connection', async (socket) => {
             }
         }
         io.to(serverId).emit('user-voice-state-updated', { username: uName, isMuted: !!isMuted, isDeafened: !!isDeafened });
+    });
+
+    socket.on('user-ring-color-update', ({ ringColor, username: explicitUser }) => {
+        const uName = explicitUser || username;
+        for (const roomKey in rooms) {
+            if (rooms[roomKey][socket.id]) {
+                rooms[roomKey][socket.id].ringColor = ringColor;
+                rooms[roomKey][socket.id].ring_color = ringColor;
+                const [sid, ...parts] = roomKey.split('_');
+                const rId = parts.join('_');
+                io.to(sid).emit('room-users-update', rId, Object.values(rooms[roomKey]));
+            }
+        }
+        io.to(serverId).emit('user-ring-color-updated', { username: uName, ringColor });
     });
 
     socket.on('chat-message', async (roomId, msg, name, isMedia) => {

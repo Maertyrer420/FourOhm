@@ -90,9 +90,17 @@ app.get('/api/friends/requests', authenticateToken, async (req, res) => {
     }
 });
 
+function resolveTargetIdentifier(body) {
+    let t = body.targetId || body.targetUsername || body.username || body.target;
+    if (typeof t === 'object' && t !== null) {
+        return t.username || t.id || '';
+    }
+    return t ? String(t).trim() : '';
+}
+
 app.post('/api/friends/request', authenticateToken, async (req, res) => {
     try {
-        const target = req.body.username || req.body.targetUsername || req.body.target;
+        const target = resolveTargetIdentifier(req.body);
         const result = await db.sendFriendRequest(req.user.id, target);
         res.json(result);
     } catch (e) {
@@ -102,7 +110,7 @@ app.post('/api/friends/request', authenticateToken, async (req, res) => {
 
 app.post('/api/friends/accept', authenticateToken, async (req, res) => {
     try {
-        const target = req.body.targetId || req.body.targetUsername || req.body.username || req.body.target;
+        const target = resolveTargetIdentifier(req.body);
         const result = await db.acceptFriendRequest(req.user.id, target);
         res.json(result);
     } catch (e) {
@@ -112,7 +120,7 @@ app.post('/api/friends/accept', authenticateToken, async (req, res) => {
 
 app.post('/api/friends/decline', authenticateToken, async (req, res) => {
     try {
-        const target = req.body.targetId || req.body.targetUsername || req.body.username || req.body.target;
+        const target = resolveTargetIdentifier(req.body);
         const result = await db.declineFriendRequest(req.user.id, target);
         res.json(result);
     } catch (e) {
@@ -122,7 +130,7 @@ app.post('/api/friends/decline', authenticateToken, async (req, res) => {
 
 app.post('/api/friends/cancel', authenticateToken, async (req, res) => {
     try {
-        const target = req.body.targetId || req.body.targetUsername || req.body.username || req.body.target;
+        const target = resolveTargetIdentifier(req.body);
         const result = await db.cancelFriendRequest(req.user.id, target);
         res.json(result);
     } catch (e) {
@@ -132,7 +140,7 @@ app.post('/api/friends/cancel', authenticateToken, async (req, res) => {
 
 app.post('/api/friends/add', authenticateToken, async (req, res) => {
     try {
-        const target = req.body.username || req.body.targetUsername || req.body.target;
+        const target = resolveTargetIdentifier(req.body);
         const friend = await db.addFriend(req.user.id, target);
         res.json(friend);
     } catch (e) {
@@ -163,6 +171,31 @@ app.post('/api/profile', authenticateToken, async (req, res) => {
     try {
         const updated = await db.saveProfile(req.user.id, req.body);
         res.json(updated);
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+app.post('/api/change-password', authenticateToken, async (req, res) => {
+    try {
+        const { oldPassword, newPassword } = req.body;
+        const result = await db.changePassword(req.user.id, oldPassword, newPassword);
+        res.json(result);
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+app.get('/api/profile/:username', async (req, res) => {
+    try {
+        const u = await db.getUserByUsername(req.params.username);
+        if (!u) return res.status(404).json({ error: 'Nutzer nicht gefunden' });
+        res.json({
+            username: u.username,
+            avatar: u.avatar || '',
+            bio: u.bio || '',
+            ringColor: u.ring_color || '#00ff00'
+        });
     } catch (e) {
         res.status(400).json({ error: e.message });
     }
@@ -396,8 +429,11 @@ app.post('/api/moderate', async (req, res) => {
     const reqRole = srv.userGroups[requestingUser] || srv.settings?.defaultRole || 'user';
     const reqPower = powerMap[reqRole] || 0;
 
+    srv.banned = srv.banned || [];
+    srv.serverMuted = srv.serverMuted || [];
+    srv.chatRestricted = srv.chatRestricted || [];
+
     if (action === 'ban' && reqPower >= 75) {
-        srv.banned = srv.banned || [];
         if (!srv.banned.includes(targetUser)) srv.banned.push(targetUser);
         await db.saveVirtualServer(serverId, srv);
         io.to(serverId).emit('user-banned', targetUser);
@@ -408,14 +444,94 @@ app.post('/api/moderate', async (req, res) => {
         return res.json({ success: true });
     }
     if (action === 'mute' && reqPower >= 50) {
+        if (!srv.serverMuted.includes(targetUser)) srv.serverMuted.push(targetUser);
+        await db.saveVirtualServer(serverId, srv);
         io.to(serverId).emit('user-server-muted', targetUser);
         return res.json({ success: true });
     }
     if (action === 'chat-restrict' && reqPower >= 50) {
+        if (!srv.chatRestricted.includes(targetUser)) srv.chatRestricted.push(targetUser);
+        await db.saveVirtualServer(serverId, srv);
         io.to(serverId).emit('user-chat-restricted', targetUser);
         return res.json({ success: true });
     }
     return res.status(403).json({ error: 'Insufficient power level or unknown action' });
+});
+
+app.get('/api/moderation/lists', async (req, res) => {
+    try {
+        const serverId = req.query.serverId || 'default';
+        const srv = await db.getVirtualServer(serverId);
+        res.json({
+            banned: srv.banned || [],
+            serverMuted: srv.serverMuted || [],
+            chatRestricted: srv.chatRestricted || []
+        });
+    } catch(e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+app.post('/api/moderation/revoke', async (req, res) => {
+    try {
+        const { serverId = 'default', targetUser, type, requestingUser } = req.body;
+        const srv = await db.getVirtualServer(serverId);
+        const reqRole = srv.userGroups[requestingUser] || srv.settings?.defaultRole || 'user';
+        const reqPower = powerMap[reqRole] || 0;
+
+        if (type === 'ban') {
+            if (reqPower < 75) return res.status(403).json({ error: 'Keine Berechtigung' });
+            srv.banned = (srv.banned || []).filter(u => u !== targetUser);
+            await db.saveVirtualServer(serverId, srv);
+            io.to(serverId).emit('user-unbanned', targetUser);
+        } else if (type === 'mute') {
+            if (reqPower < 50) return res.status(403).json({ error: 'Keine Berechtigung' });
+            srv.serverMuted = (srv.serverMuted || []).filter(u => u !== targetUser);
+            await db.saveVirtualServer(serverId, srv);
+            io.to(serverId).emit('user-server-unmuted', targetUser);
+        } else if (type === 'chat-restrict') {
+            if (reqPower < 50) return res.status(403).json({ error: 'Keine Berechtigung' });
+            srv.chatRestricted = (srv.chatRestricted || []).filter(u => u !== targetUser);
+            await db.saveVirtualServer(serverId, srv);
+            io.to(serverId).emit('user-chat-unrestricted', targetUser);
+        }
+        res.json({ success: true });
+    } catch(e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+app.post('/api/moderation/add', async (req, res) => {
+    try {
+        const { serverId = 'default', targetUser, type, requestingUser } = req.body;
+        if (!targetUser) return res.status(400).json({ error: 'Benutzer erforderlich' });
+        const srv = await db.getVirtualServer(serverId);
+        const reqRole = srv.userGroups[requestingUser] || srv.settings?.defaultRole || 'user';
+        const reqPower = powerMap[reqRole] || 0;
+
+        if (type === 'ban') {
+            if (reqPower < 75) return res.status(403).json({ error: 'Keine Berechtigung' });
+            srv.banned = srv.banned || [];
+            if (!srv.banned.includes(targetUser)) srv.banned.push(targetUser);
+            await db.saveVirtualServer(serverId, srv);
+            io.to(serverId).emit('user-banned', targetUser);
+        } else if (type === 'mute') {
+            if (reqPower < 50) return res.status(403).json({ error: 'Keine Berechtigung' });
+            srv.serverMuted = srv.serverMuted || [];
+            if (!srv.serverMuted.includes(targetUser)) srv.serverMuted.push(targetUser);
+            await db.saveVirtualServer(serverId, srv);
+            io.to(serverId).emit('user-server-muted', targetUser);
+        } else if (type === 'chat-restrict') {
+            if (reqPower < 50) return res.status(403).json({ error: 'Keine Berechtigung' });
+            srv.chatRestricted = srv.chatRestricted || [];
+            if (!srv.chatRestricted.includes(targetUser)) srv.chatRestricted.push(targetUser);
+            await db.saveVirtualServer(serverId, srv);
+            io.to(serverId).emit('user-chat-restricted', targetUser);
+        }
+        res.json({ success: true });
+    } catch(e) {
+        res.status(400).json({ error: e.message });
+    }
 });
 
 // --- Realtime Presence, Chat & WebRTC Voice ---
@@ -555,6 +671,20 @@ io.on('connection', async (socket) => {
             }
         }
         io.to(currentSid).emit('user-voice-state-updated', { username: uName, isMuted: !!isMuted, isDeafened: !!isDeafened });
+    });
+
+    socket.on('user-ring-color-update', ({ ringColor, username: explicitUser }) => {
+        const currentSid = serverId || 'default';
+        const uName = explicitUser || username || onlineUsers[socket.id];
+        for (const roomKey in rooms) {
+            if (rooms[roomKey][socket.id]) {
+                rooms[roomKey][socket.id].ringColor = ringColor;
+                rooms[roomKey][socket.id].ring_color = ringColor;
+                const rId = roomKey.replace(currentSid + '_', '');
+                io.to(currentSid).emit('room-users-update', rId, Object.values(rooms[roomKey]));
+            }
+        }
+        io.to(currentSid).emit('user-ring-color-updated', { username: uName, ringColor });
     });
 
     socket.on('chat-message', async (roomId, msg, name, isMedia) => {
