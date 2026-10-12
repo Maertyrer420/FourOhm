@@ -1,0 +1,17 @@
+{
+  "name": "voice-server",
+  "version": "1.0.0",
+  "description": "Dedicated Server for 4Ω (FourOhm)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.3",
+    "multer": "^2.4.0",
+    "pg": "^8.23.1",
+    "socket.io": "^4.8.0"
+  }
+}
