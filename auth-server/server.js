@@ -30,7 +30,24 @@ function authenticateToken(req, res, next) {
 
 // --- Health Check ---
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', server: '4Ohm Unified Server', timestamp: Date.now() });
+    res.json({
+        status: 'ok',
+        server: '4Ohm Unified Server',
+        database: db.usingPostgres() ? 'PostgreSQL (Neon Connected)' : 'Local JSON Fallback (Temporary)',
+        timestamp: Date.now()
+    });
+});
+
+// --- Server Info ---
+app.get('/api/server-info', async (req, res) => {
+    const serverId = req.query.serverId || 'default';
+    const srv = await db.getVirtualServer(serverId);
+    res.json({
+        id: 'default',
+        name: srv.name || '4Ohm Server',
+        channels: srv.channels || [],
+        welcomeMessage: srv.settings?.welcomeMessage || 'Willkommen auf dem 4Ohm Server!'
+    });
 });
 
 // --- Auth Routes ---
@@ -279,11 +296,12 @@ const userSockets = {}; // username -> socketId
 const rooms = {};       // serverId_roomId -> { socketId: userObj }
 
 io.on('connection', async (socket) => {
-    const serverId = socket.handshake.query.serverId;
+    const rawServerId = socket.handshake.query.serverId;
+    const serverId = rawServerId || 'default';
     const username = socket.handshake.query.username;
 
     // 1. If connecting to a virtual server:
-    if (serverId) {
+    if (rawServerId || username) {
         socket.join(serverId);
         const srv = await db.getVirtualServer(serverId);
 
@@ -300,6 +318,14 @@ io.on('connection', async (socket) => {
         }
         socket.emit('group-update', srv.userGroups || {});
         socket.emit('channels-update', srv.channels || []);
+
+        // Sync active channel members to the connecting user
+        for (const roomKey in rooms) {
+            if (roomKey.startsWith(serverId + '_')) {
+                const rId = roomKey.replace(serverId + '_', '');
+                socket.emit('room-users-update', rId, Object.values(rooms[roomKey]));
+            }
+        }
     }
 
     // 2. Global Auth socket registration:
@@ -360,8 +386,8 @@ io.on('connection', async (socket) => {
         const msgObj = { senderName: name, msg, timestamp: Date.now(), isMedia };
         await db.addMessage(currentSid, roomId, msgObj);
 
-        const roomKey = currentSid + '_' + roomId;
-        io.to(roomKey).emit('chat-message', socket.id, name, msg, roomId, msgObj.timestamp);
+        // Broadcast to all clients on this server
+        io.to(currentSid).emit('chat-message', socket.id, name, msg, roomId, msgObj.timestamp);
     });
 
     // 4. WebRTC Signaling:
