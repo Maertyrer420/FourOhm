@@ -14,23 +14,7 @@ app.use(cors());
 app.use(express.json());
 
 app.get('/health', (req, res) => {
-    res.json({
-        status: 'ok',
-        server: '4Ohm Dedicated Voice Server',
-        database: db.usingPostgres() ? 'PostgreSQL (Neon Connected)' : 'Local JSON Fallback (Temporary)',
-        timestamp: Date.now()
-    });
-});
-
-app.get('/api/server-info', async (req, res) => {
-    const srvId = req.query.serverId || 'default';
-    const srv = await db.getVirtualServer(srvId);
-    res.json({
-        id: 'default',
-        name: srv.name || '4Ohm Voice Server',
-        channels: srv.channels || [],
-        welcomeMessage: srv.settings?.welcomeMessage || 'Willkommen auf dem 4Ohm Voice Server!'
-    });
+    res.json({ status: 'ok', server: '4Ohm Dedicated Voice Server', timestamp: Date.now() });
 });
 
 // Settings
@@ -122,6 +106,24 @@ app.post('/api/groups/assign', async (req, res) => {
     await db.saveVirtualServer(srvId, srv);
 
     io.to(srvId).emit('group-update', srv.userGroups);
+
+    // Live update in all active voice rooms on this server:
+    for (const roomKey in rooms) {
+        if (roomKey.startsWith(srvId + '_')) {
+            let changed = false;
+            for (const sockId in rooms[roomKey]) {
+                if (rooms[roomKey][sockId].name === targetUser) {
+                    rooms[roomKey][sockId].groupId = groupId;
+                    changed = true;
+                }
+            }
+            if (changed) {
+                const rId = roomKey.replace(srvId + '_', '');
+                io.to(srvId).emit('room-users-update', rId, Object.values(rooms[roomKey]));
+            }
+        }
+    }
+
     res.json({ success: true });
 });
 
@@ -179,14 +181,6 @@ io.on('connection', async (socket) => {
     socket.emit('group-update', srv.userGroups || {});
     socket.emit('channels-update', srv.channels || []);
 
-    // Sync active channel members to the connecting user
-    for (const roomKey in rooms) {
-        if (roomKey.startsWith(serverId + '_')) {
-            const rId = roomKey.replace(serverId + '_', '');
-            socket.emit('room-users-update', rId, Object.values(rooms[roomKey]));
-        }
-    }
-
     socket.on('join-room', async (roomId, peerId, userObj) => {
         const roomKey = serverId + '_' + roomId;
         socket.join(roomKey);
@@ -218,12 +212,39 @@ io.on('connection', async (socket) => {
         }
     });
 
+    socket.on('afk-status', ({ isAfk, afkMessage, username: explicitUser }) => {
+        const uName = explicitUser || username;
+        for (const roomKey in rooms) {
+            if (rooms[roomKey][socket.id]) {
+                rooms[roomKey][socket.id].isAfk = !!isAfk;
+                rooms[roomKey][socket.id].afkMessage = afkMessage ? String(afkMessage).slice(0, 100) : '';
+                const [sid, ...parts] = roomKey.split('_');
+                const rId = parts.join('_');
+                io.to(sid).emit('room-users-update', rId, Object.values(rooms[roomKey]));
+            }
+        }
+        io.to(serverId).emit('user-afk-updated', { username: uName, isAfk: !!isAfk, afkMessage: afkMessage ? String(afkMessage).slice(0, 100) : '' });
+    });
+
+    socket.on('stream-status', ({ isStreaming, username: explicitUser }) => {
+        const uName = explicitUser || username;
+        for (const roomKey in rooms) {
+            if (rooms[roomKey][socket.id]) {
+                rooms[roomKey][socket.id].isStreaming = !!isStreaming;
+                const [sid, ...parts] = roomKey.split('_');
+                const rId = parts.join('_');
+                io.to(sid).emit('room-users-update', rId, Object.values(rooms[roomKey]));
+            }
+        }
+        io.to(serverId).emit('user-stream-updated', { username: uName, isStreaming: !!isStreaming });
+    });
+
     socket.on('chat-message', async (roomId, msg, name, isMedia) => {
         const msgObj = { senderName: name, msg, timestamp: Date.now(), isMedia };
         await db.addMessage(serverId, roomId, msgObj);
 
-        // Broadcast to all clients on this server
-        io.to(serverId).emit('chat-message', socket.id, name, msg, roomId, msgObj.timestamp);
+        const roomKey = serverId + '_' + roomId;
+        io.to(roomKey).emit('chat-message', socket.id, name, msg, roomId, msgObj.timestamp);
     });
 
     socket.on('offer', (targetId, offer, senderName) => {

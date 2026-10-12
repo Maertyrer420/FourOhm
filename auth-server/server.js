@@ -92,7 +92,8 @@ app.get('/api/friends/requests', authenticateToken, async (req, res) => {
 
 app.post('/api/friends/request', authenticateToken, async (req, res) => {
     try {
-        const result = await db.sendFriendRequest(req.user.id, req.body.username);
+        const target = req.body.username || req.body.targetUsername || req.body.target;
+        const result = await db.sendFriendRequest(req.user.id, target);
         res.json(result);
     } catch (e) {
         res.status(400).json({ error: e.message });
@@ -101,7 +102,8 @@ app.post('/api/friends/request', authenticateToken, async (req, res) => {
 
 app.post('/api/friends/accept', authenticateToken, async (req, res) => {
     try {
-        const result = await db.acceptFriendRequest(req.user.id, req.body.targetId);
+        const target = req.body.targetId || req.body.targetUsername || req.body.username || req.body.target;
+        const result = await db.acceptFriendRequest(req.user.id, target);
         res.json(result);
     } catch (e) {
         res.status(400).json({ error: e.message });
@@ -110,7 +112,8 @@ app.post('/api/friends/accept', authenticateToken, async (req, res) => {
 
 app.post('/api/friends/decline', authenticateToken, async (req, res) => {
     try {
-        const result = await db.declineFriendRequest(req.user.id, req.body.targetId);
+        const target = req.body.targetId || req.body.targetUsername || req.body.username || req.body.target;
+        const result = await db.declineFriendRequest(req.user.id, target);
         res.json(result);
     } catch (e) {
         res.status(400).json({ error: e.message });
@@ -119,7 +122,8 @@ app.post('/api/friends/decline', authenticateToken, async (req, res) => {
 
 app.post('/api/friends/cancel', authenticateToken, async (req, res) => {
     try {
-        const result = await db.cancelFriendRequest(req.user.id, req.body.targetId);
+        const target = req.body.targetId || req.body.targetUsername || req.body.username || req.body.target;
+        const result = await db.cancelFriendRequest(req.user.id, target);
         res.json(result);
     } catch (e) {
         res.status(400).json({ error: e.message });
@@ -128,7 +132,8 @@ app.post('/api/friends/cancel', authenticateToken, async (req, res) => {
 
 app.post('/api/friends/add', authenticateToken, async (req, res) => {
     try {
-        const friend = await db.addFriend(req.user.id, req.body.username);
+        const target = req.body.username || req.body.targetUsername || req.body.target;
+        const friend = await db.addFriend(req.user.id, target);
         res.json(friend);
     } catch (e) {
         res.status(400).json({ error: e.message });
@@ -340,6 +345,24 @@ app.post('/api/groups/assign', async (req, res) => {
     await db.saveVirtualServer(serverId, srv);
 
     io.to(serverId).emit('group-update', srv.userGroups);
+
+    // Live update in all active voice rooms on this server:
+    for (const roomKey in rooms) {
+        if (roomKey.startsWith(serverId + '_')) {
+            let changed = false;
+            for (const sockId in rooms[roomKey]) {
+                if (rooms[roomKey][sockId].name === targetUser) {
+                    rooms[roomKey][sockId].groupId = groupId;
+                    changed = true;
+                }
+            }
+            if (changed) {
+                const rId = roomKey.replace(serverId + '_', '');
+                io.to(serverId).emit('room-users-update', rId, Object.values(rooms[roomKey]));
+            }
+        }
+    }
+
     res.json({ success: true });
 });
 
@@ -469,6 +492,33 @@ io.on('connection', async (socket) => {
             socket.leave(roomKey);
             io.to(currentSid).emit('room-users-update', roomId, Object.values(rooms[roomKey]));
         }
+    });
+
+    socket.on('afk-status', ({ isAfk, afkMessage, username: explicitUser }) => {
+        const currentSid = serverId || 'default';
+        const uName = explicitUser || username || onlineUsers[socket.id];
+        for (const roomKey in rooms) {
+            if (rooms[roomKey][socket.id]) {
+                rooms[roomKey][socket.id].isAfk = !!isAfk;
+                rooms[roomKey][socket.id].afkMessage = afkMessage ? String(afkMessage).slice(0, 100) : '';
+                const rId = roomKey.replace(currentSid + '_', '');
+                io.to(currentSid).emit('room-users-update', rId, Object.values(rooms[roomKey]));
+            }
+        }
+        io.to(currentSid).emit('user-afk-updated', { username: uName, isAfk: !!isAfk, afkMessage: afkMessage ? String(afkMessage).slice(0, 100) : '' });
+    });
+
+    socket.on('stream-status', ({ isStreaming, username: explicitUser }) => {
+        const currentSid = serverId || 'default';
+        const uName = explicitUser || username || onlineUsers[socket.id];
+        for (const roomKey in rooms) {
+            if (rooms[roomKey][socket.id]) {
+                rooms[roomKey][socket.id].isStreaming = !!isStreaming;
+                const rId = roomKey.replace(currentSid + '_', '');
+                io.to(currentSid).emit('room-users-update', rId, Object.values(rooms[roomKey]));
+            }
+        }
+        io.to(currentSid).emit('user-stream-updated', { username: uName, isStreaming: !!isStreaming });
     });
 
     socket.on('chat-message', async (roomId, msg, name, isMedia) => {

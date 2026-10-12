@@ -305,21 +305,28 @@ module.exports = {
         }
     },
 
-    acceptFriendRequest: async (userId, targetId) => {
+    acceptFriendRequest: async (userId, targetIdentifier) => {
+        if (!targetIdentifier) throw new Error('Ziel-Nutzer erforderlich.');
         if (pgPool) {
             const uRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [userId]);
-            const tRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [targetId]);
             const user = uRes.rows[0];
-            const target = tRes.rows[0];
-            if (!user || !target) throw new Error('Nutzer nicht gefunden.');
+            if (!user) throw new Error('Nutzer nicht gefunden.');
 
-            const uIn = (user.requests_in || []).filter(r => r.id !== targetId);
-            const tOut = (target.requests_out || []).filter(r => r.id !== userId);
+            let tRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [targetIdentifier]);
+            if (!tRes.rows[0]) {
+                tRes = await pgPool.query('SELECT * FROM users WHERE LOWER(username) = LOWER($1)', [targetIdentifier]);
+            }
+            const target = tRes.rows[0];
+            if (!target) throw new Error('Ziel-Nutzer nicht gefunden.');
+            const targetId = target.id;
+
+            const uIn = (user.requests_in || []).filter(r => (typeof r === 'object' ? r.id !== targetId : r !== targetId && r !== target.username));
+            const tOut = (target.requests_out || []).filter(r => (typeof r === 'object' ? r.id !== userId : r !== userId && r !== user.username));
 
             const uFriends = Array.isArray(user.friends) ? user.friends : [];
             const tFriends = Array.isArray(target.friends) ? target.friends : [];
-            if (!uFriends.includes(targetId)) uFriends.push(targetId);
-            if (!tFriends.includes(userId)) tFriends.push(userId);
+            if (!uFriends.includes(targetId) && targetId !== userId) uFriends.push(targetId);
+            if (!tFriends.includes(userId) && userId !== targetId) tFriends.push(userId);
 
             await pgPool.query('UPDATE users SET requests_in = $1, friends = $2 WHERE id = $3', [JSON.stringify(uIn), JSON.stringify(uFriends), userId]);
             await pgPool.query('UPDATE users SET requests_out = $1, friends = $2 WHERE id = $3', [JSON.stringify(tOut), JSON.stringify(tFriends), targetId]);
@@ -327,65 +334,85 @@ module.exports = {
         } else {
             const users = getLocalUsers();
             const user = users.find(u => u.id === userId);
-            const target = users.find(u => u.id === targetId);
-            if (!user || !target) throw new Error('Nutzer nicht gefunden.');
+            if (!user) throw new Error('Nutzer nicht gefunden.');
+            const target = users.find(u => u.id === targetIdentifier || u.username.toLowerCase() === targetIdentifier.toLowerCase());
+            if (!target) throw new Error('Ziel-Nutzer nicht gefunden.');
+            const targetId = target.id;
 
-            user.requestsIn = (user.requestsIn || []).filter(r => r.id !== targetId);
-            target.requestsOut = (target.requestsOut || []).filter(r => r.id !== userId);
+            user.requestsIn = (user.requestsIn || []).filter(r => (typeof r === 'object' ? r.id !== targetId : r !== targetId && r !== target.username));
+            target.requestsOut = (target.requestsOut || []).filter(r => (typeof r === 'object' ? r.id !== userId : r !== userId && r !== user.username));
 
             if (!user.friends) user.friends = [];
             if (!target.friends) target.friends = [];
-            if (!user.friends.includes(targetId)) user.friends.push(targetId);
-            if (!target.friends.includes(userId)) target.friends.push(userId);
+            if (!user.friends.includes(targetId) && targetId !== userId) user.friends.push(targetId);
+            if (!target.friends.includes(userId) && userId !== targetId) target.friends.push(userId);
 
             saveLocalUsers(users);
             return { success: true, friend: { id: target.id, username: target.username } };
         }
     },
 
-    declineFriendRequest: async (userId, targetId) => {
+    declineFriendRequest: async (userId, targetIdentifier) => {
+        if (!targetIdentifier) throw new Error('Ziel-Nutzer erforderlich.');
         if (pgPool) {
             const uRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [userId]);
-            const tRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [targetId]);
+            let tRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [targetIdentifier]);
+            if (!tRes.rows[0]) {
+                tRes = await pgPool.query('SELECT * FROM users WHERE LOWER(username) = LOWER($1)', [targetIdentifier]);
+            }
+            const target = tRes.rows[0];
+            const targetId = target ? target.id : targetIdentifier;
+
             if (uRes.rows[0]) {
-                const uIn = (uRes.rows[0].requests_in || []).filter(r => r.id !== targetId);
+                const uIn = (uRes.rows[0].requests_in || []).filter(r => (typeof r === 'object' ? r.id !== targetId : r !== targetId && (!target || r !== target.username)));
                 await pgPool.query('UPDATE users SET requests_in = $1 WHERE id = $2', [JSON.stringify(uIn), userId]);
             }
-            if (tRes.rows[0]) {
-                const tOut = (tRes.rows[0].requests_out || []).filter(r => r.id !== userId);
+            if (target) {
+                const tOut = (target.requests_out || []).filter(r => (typeof r === 'object' ? r.id !== userId : r !== userId));
                 await pgPool.query('UPDATE users SET requests_out = $1 WHERE id = $2', [JSON.stringify(tOut), targetId]);
             }
             return { success: true };
         } else {
             const users = getLocalUsers();
             const user = users.find(u => u.id === userId);
-            const target = users.find(u => u.id === targetId);
-            if (user) user.requestsIn = (user.requestsIn || []).filter(r => r.id !== targetId);
-            if (target) target.requestsOut = (target.requestsOut || []).filter(r => r.id !== userId);
+            const target = users.find(u => u.id === targetIdentifier || u.username.toLowerCase() === targetIdentifier.toLowerCase());
+            const targetId = target ? target.id : targetIdentifier;
+
+            if (user) user.requestsIn = (user.requestsIn || []).filter(r => (typeof r === 'object' ? r.id !== targetId : r !== targetId && (!target || r !== target.username)));
+            if (target) target.requestsOut = (target.requestsOut || []).filter(r => (typeof r === 'object' ? r.id !== userId : r !== userId));
             saveLocalUsers(users);
             return { success: true };
         }
     },
 
-    cancelFriendRequest: async (userId, targetId) => {
+    cancelFriendRequest: async (userId, targetIdentifier) => {
+        if (!targetIdentifier) throw new Error('Ziel-Nutzer erforderlich.');
         if (pgPool) {
             const uRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [userId]);
-            const tRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [targetId]);
+            let tRes = await pgPool.query('SELECT * FROM users WHERE id = $1', [targetIdentifier]);
+            if (!tRes.rows[0]) {
+                tRes = await pgPool.query('SELECT * FROM users WHERE LOWER(username) = LOWER($1)', [targetIdentifier]);
+            }
+            const target = tRes.rows[0];
+            const targetId = target ? target.id : targetIdentifier;
+
             if (uRes.rows[0]) {
-                const uOut = (uRes.rows[0].requests_out || []).filter(r => r.id !== targetId);
+                const uOut = (uRes.rows[0].requests_out || []).filter(r => (typeof r === 'object' ? r.id !== targetId : r !== targetId && (!target || r !== target.username)));
                 await pgPool.query('UPDATE users SET requests_out = $1 WHERE id = $2', [JSON.stringify(uOut), userId]);
             }
-            if (tRes.rows[0]) {
-                const tIn = (tRes.rows[0].requests_in || []).filter(r => r.id !== userId);
+            if (target) {
+                const tIn = (target.requests_in || []).filter(r => (typeof r === 'object' ? r.id !== userId : r !== userId));
                 await pgPool.query('UPDATE users SET requests_in = $1 WHERE id = $2', [JSON.stringify(tIn), targetId]);
             }
             return { success: true };
         } else {
             const users = getLocalUsers();
             const user = users.find(u => u.id === userId);
-            const target = users.find(u => u.id === targetId);
-            if (user) user.requestsOut = (user.requestsOut || []).filter(r => r.id !== targetId);
-            if (target) target.requestsIn = (target.requestsIn || []).filter(r => r.id !== userId);
+            const target = users.find(u => u.id === targetIdentifier || u.username.toLowerCase() === targetIdentifier.toLowerCase());
+            const targetId = target ? target.id : targetIdentifier;
+
+            if (user) user.requestsOut = (user.requestsOut || []).filter(r => (typeof r === 'object' ? r.id !== targetId : r !== targetId && (!target || r !== target.username)));
+            if (target) target.requestsIn = (target.requestsIn || []).filter(r => (typeof r === 'object' ? r.id !== userId : r !== userId));
             saveLocalUsers(users);
             return { success: true };
         }
@@ -416,27 +443,37 @@ module.exports = {
     getFriends: async (userId) => {
         if (pgPool) {
             const res = await pgPool.query('SELECT friends FROM users WHERE id = $1', [userId]);
-            const friendIds = res.rows[0]?.friends || [];
+            let friendIds = res.rows[0]?.friends || [];
+            if (typeof friendIds === 'string') {
+                try { friendIds = JSON.parse(friendIds); } catch(e) { friendIds = []; }
+            }
+            friendIds = (Array.isArray(friendIds) ? friendIds : []).filter(id => id && id !== userId);
             if (!friendIds.length) return [];
             const friendsRes = await pgPool.query('SELECT id, username, bio, avatar, ring_color FROM users WHERE id = ANY($1)', [friendIds]);
-            return friendsRes.rows.map(r => ({
-                id: r.id,
-                username: r.username,
-                bio: r.bio || '',
-                avatar: r.avatar || '',
-                ringColor: r.ring_color || '#00ff00'
-            }));
+            return friendsRes.rows
+                .filter(r => r.id !== userId)
+                .map(r => ({
+                    id: r.id,
+                    username: r.username,
+                    bio: r.bio || '',
+                    avatar: r.avatar || '',
+                    ringColor: r.ring_color || '#00ff00'
+                }));
         } else {
             const users = getLocalUsers();
             const user = users.find(u => u.id === userId);
             if (!user || !user.friends) return [];
-            return users.filter(u => user.friends.includes(u.id)).map(u => ({
-                id: u.id,
-                username: u.username,
-                bio: u.bio || '',
-                avatar: u.avatar || '',
-                ringColor: u.ringColor || '#00ff00'
-            }));
+            let fList = Array.isArray(user.friends) ? user.friends : [];
+            fList = fList.filter(id => id && id !== userId);
+            return users
+                .filter(u => fList.includes(u.id) && u.id !== userId)
+                .map(u => ({
+                    id: u.id,
+                    username: u.username,
+                    bio: u.bio || '',
+                    avatar: u.avatar || '',
+                    ringColor: u.ringColor || '#00ff00'
+                }));
         }
     },
 
