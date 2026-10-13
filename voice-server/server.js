@@ -38,7 +38,12 @@ app.get('/api/profile/:username', async (req, res) => {
                     banner: u.banner || '',
                     bio: u.bio || '',
                     ringColor: u.ringColor || u.ring_color || '#00ff00',
-                    role: u.groupId || 'user'
+                    role: u.groupId || 'user',
+                    steamId: u.steamId || u.steam_id || '',
+                    steamUsername: u.steamUsername || u.steam_username || '',
+                    steamAvatar: u.steamAvatar || u.steam_avatar || '',
+                    cs2InventoryMode: u.cs2InventoryMode || u.cs2_inventory_mode || 'filtered',
+                    cs2ShowcaseItems: Array.isArray(u.cs2ShowcaseItems || u.cs2_showcase_items) ? (u.cs2ShowcaseItems || u.cs2_showcase_items) : []
                 };
                 cachedUserProfiles[u.name] = prof;
                 return res.json(prof);
@@ -46,6 +51,18 @@ app.get('/api/profile/:username', async (req, res) => {
         }
     }
     res.status(404).json({ error: 'Nutzer nicht gefunden' });
+});
+
+// CS2 Inventory Proxy (delegates to auth server)
+app.get('/api/cs2/inventory/:username', async (req, res) => {
+    const authUrl = process.env.AUTH_SERVER_URL || 'https://fourohm-auth.onrender.com';
+    try {
+        const response = await fetch(`${authUrl}/api/cs2/inventory/${encodeURIComponent(req.params.username)}${req.query.refresh === 'true' ? '?refresh=true' : ''}`);
+        const data = await response.json();
+        return res.status(response.status).json(data);
+    } catch (e) {
+        return res.status(500).json({ error: e.message });
+    }
 });
 
 // Settings & Server Meta

@@ -195,11 +195,428 @@ app.get('/api/profile/:username', async (req, res) => {
             username: u.username,
             avatar: u.avatar || '',
             bio: u.bio || '',
-            ringColor: u.ring_color || '#00ff00',
-            banner: u.banner || ''
+            ringColor: u.ring_color || u.ringColor || '#00ff00',
+            banner: u.banner || '',
+            steamId: u.steam_id || u.steamId || '',
+            steamUsername: u.steam_username || u.steamUsername || '',
+            steamAvatar: u.steam_avatar || u.steamAvatar || '',
+            cs2InventoryMode: u.cs2_inventory_mode || u.cs2InventoryMode || 'filtered',
+            cs2ShowcaseItems: Array.isArray(u.cs2_showcase_items || u.cs2ShowcaseItems) ? (u.cs2_showcase_items || u.cs2ShowcaseItems) : []
         });
     } catch (e) {
         res.status(400).json({ error: e.message });
+    }
+});
+
+// --- Steam & CS2 Inventory Helper & Endpoints ---
+const steamInventoryMemoryCache = {}; // username -> { ts: timestamp, items: [...] }
+
+async function fetchValveCs2Inventory(steamId) {
+    if (!steamId) throw new Error('SteamID fehlt.');
+    const url = `https://steamcommunity.com/inventory/${encodeURIComponent(steamId)}/730/2?l=german&count=2000`;
+    const res = await fetch(url, {
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Referer': 'https://steamcommunity.com/'
+        }
+    });
+
+    if (res.status === 401 || res.status === 403) {
+        const err = new Error('private');
+        err.statusCode = 403;
+        throw err;
+    }
+    if (res.status === 429) {
+        const err = new Error('rate_limited');
+        err.statusCode = 429;
+        throw err;
+    }
+    if (!res.ok) {
+        throw new Error(`Steam API Fehler: HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+    if (!data || !data.descriptions) {
+        return [];
+    }
+
+    // Map descriptions by classid_instanceid
+    const descMap = {};
+    for (const d of data.descriptions) {
+        const key = `${d.classid}_${d.instanceid || '0'}`;
+        descMap[key] = d;
+    }
+
+    const items = [];
+    const assets = Array.isArray(data.assets) ? data.assets : [];
+
+    for (const a of assets) {
+        const key = `${a.classid}_${a.instanceid || '0'}`;
+        const d = descMap[key];
+        if (!d) continue;
+
+        // Tags
+        const tags = Array.isArray(d.tags) ? d.tags : [];
+        const typeTag = tags.find(t => t.category === 'Type');
+        const rarityTag = tags.find(t => t.category === 'Rarity');
+        const weaponTag = tags.find(t => t.category === 'Weapon');
+        const exteriorTag = tags.find(t => t.category === 'Exterior');
+
+        const typeStr = d.type || typeTag?.localized_tag_name || '';
+        const nameStr = d.market_hash_name || d.name || 'CS2 Item';
+        
+        // Category determination
+        let category = 'other';
+        const typeLower = (typeStr + ' ' + nameStr).toLowerCase();
+        if (typeLower.includes('messer') || typeLower.includes('knife') || typeLower.includes('karambit') || typeLower.includes('bayonet') || typeLower.includes('daggers')) {
+            category = 'knife';
+        } else if (typeLower.includes('handschuh') || typeLower.includes('glove') || typeLower.includes('wraps')) {
+            category = 'glove';
+        } else if (typeLower.includes('gewehr') || typeLower.includes('rifle') || typeLower.includes('ak-47') || typeLower.includes('m4a4') || typeLower.includes('m4a1-s')) {
+            category = 'rifle';
+        } else if (typeLower.includes('scharfschütze') || typeLower.includes('sniper') || typeLower.includes('awp') || typeLower.includes('scout') || typeLower.includes('ssg 08')) {
+            category = 'sniper';
+        } else if (typeLower.includes('pistole') || typeLower.includes('pistol') || typeLower.includes('glock') || typeLower.includes('usp') || typeLower.includes('deagle')) {
+            category = 'pistol';
+        } else if (typeLower.includes('mp') || typeLower.includes('smg') || typeLower.includes('p90') || typeLower.includes('mp9') || typeLower.includes('mac-10')) {
+            category = 'smg';
+        } else if (typeLower.includes('kiste') || typeLower.includes('case') || typeLower.includes('container') || typeLower.includes('kapsel') || typeLower.includes('capsule')) {
+            category = 'container';
+        } else if (typeLower.includes('aufkleber') || typeLower.includes('sticker') || typeLower.includes('patch')) {
+            category = 'sticker';
+        } else if (typeLower.includes('agent') || typeLower.includes('agentin')) {
+            category = 'agent';
+        }
+
+        const rarityName = rarityTag?.localized_tag_name || 'Standard';
+        let rarityColor = rarityTag?.color ? ('#' + rarityTag.color) : '#b0c3d9';
+        // Fallback colors for CS2 rarities if color tag missing
+        if (!rarityTag?.color) {
+            if (category === 'knife' || category === 'glove') rarityColor = '#e4ae39';
+            else if (rarityName.toLowerCase().includes('verdeckt') || rarityName.toLowerCase().includes('covert')) rarityColor = '#eb4b4b';
+            else if (rarityName.toLowerCase().includes('klassifiziert') || rarityName.toLowerCase().includes('classified')) rarityColor = '#d32ce6';
+            else if (rarityName.toLowerCase().includes('vertraulich') || rarityName.toLowerCase().includes('restricted')) rarityColor = '#8847ff';
+            else if (rarityName.toLowerCase().includes('militär') || rarityName.toLowerCase().includes('mil-spec')) rarityColor = '#4b69ff';
+        }
+
+        const iconUrl = d.icon_url 
+            ? `https://community.cloudflare.steamstatic.com/economy/image/${d.icon_url}/360fx360f` 
+            : '';
+        const marketUrl = `https://steamcommunity.com/market/listings/730/${encodeURIComponent(d.market_hash_name || d.name)}`;
+
+        let inspectUrl = '';
+        if (Array.isArray(d.actions) && d.actions.length > 0 && d.actions[0].link) {
+            inspectUrl = d.actions[0].link
+                .replace('%owner_steamid%', steamId)
+                .replace('%assetid%', a.assetid);
+        }
+
+        items.push({
+            assetid: a.assetid,
+            classid: a.classid,
+            instanceid: a.instanceid || '0',
+            name: d.name,
+            marketHashName: d.market_hash_name || d.name,
+            iconUrl,
+            type: typeStr,
+            rarity: { name: rarityName, color: rarityColor },
+            category,
+            weapon: weaponTag?.localized_tag_name || '',
+            exterior: exteriorTag?.localized_tag_name || '',
+            marketUrl,
+            inspectUrl
+        });
+    }
+
+    return items;
+}
+
+// 1. Steam OpenID Login Initiation
+app.get('/api/auth/steam', (req, res) => {
+    const userToken = req.query.token;
+    if (!userToken) return res.status(400).send("Fehlendes Authentifizierungs-Token.");
+
+    const host = req.get('host');
+    const protocol = req.protocol === 'https' || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+    const baseUrl = `${protocol}://${host}`;
+    const returnTo = `${baseUrl}/api/auth/steam/callback?token=${encodeURIComponent(userToken)}`;
+
+    const params = new URLSearchParams({
+        'openid.ns': 'http://specs.openid.net/auth/2.0',
+        'openid.mode': 'checkid_setup',
+        'openid.return_to': returnTo,
+        'openid.realm': baseUrl,
+        'openid.identity': 'http://specs.openid.net/auth/2.0/identifier_select',
+        'openid.claimed_id': 'http://specs.openid.net/auth/2.0/identifier_select'
+    });
+
+    res.redirect(`https://steamcommunity.com/openid/login?${params.toString()}`);
+});
+
+// 2. Steam OpenID Callback & Verification
+app.get('/api/auth/steam/callback', async (req, res) => {
+    try {
+        const userToken = req.query.token;
+        if (!userToken) return res.status(400).send("Ungültige Anfrage: Kein Token angegeben.");
+
+        let decoded;
+        try {
+            decoded = jwt.verify(userToken, JWT_SECRET);
+        } catch (e) {
+            return res.status(401).send("Sitzung abgelaufen. Bitte versuche es erneut in 4Ω.");
+        }
+
+        // Verify OpenID signature directly with Steam
+        const verifyParams = new URLSearchParams(req.query);
+        verifyParams.set('openid.mode', 'check_authentication');
+
+        const verifyRes = await fetch('https://steamcommunity.com/openid/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: verifyParams.toString()
+        });
+        const verifyText = await verifyRes.text();
+
+        if (!verifyText.includes('is_valid:true')) {
+            return res.status(400).send("Steam-Validierung fehlgeschlagen.");
+        }
+
+        const claimedId = req.query['openid.claimed_id'] || '';
+        const match = claimedId.match(/\/id\/(\d+)/);
+        if (!match || !match[1]) {
+            return res.status(400).send("SteamID konnte nicht ermittelt werden.");
+        }
+        const steamId = match[1];
+
+        // Fetch Steam public profile info
+        let steamUsername = '';
+        let steamAvatar = '';
+        try {
+            const profileRes = await fetch(`https://steamcommunity.com/profiles/${steamId}?xml=1`);
+            if (profileRes.ok) {
+                const xml = await profileRes.text();
+                const nameMatch = xml.match(/<steamID><!\[CDATA\[(.*?)\]\]><\/steamID>/) || xml.match(/<steamID>(.*?)<\/steamID>/);
+                if (nameMatch) steamUsername = nameMatch[1];
+                const avMatch = xml.match(/<avatarFull><!\[CDATA\[(.*?)\]\]><\/avatarFull>/) || xml.match(/<avatarFull>(.*?)<\/avatarFull>/);
+                if (avMatch) steamAvatar = avMatch[1];
+            }
+        } catch (e) {}
+
+        await db.linkSteamAccount(decoded.id, {
+            steamId,
+            steamUsername: steamUsername || steamId,
+            steamAvatar: steamAvatar || ''
+        });
+
+        res.send(`
+            <!DOCTYPE html>
+            <html lang="de">
+            <head>
+                <meta charset="utf-8">
+                <title>Steam verbunden | 4Ω</title>
+                <style>
+                    body { background: #0c0d12; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+                    .card { background: #14151e; border: 1px solid rgba(255,255,255,0.1); border-radius: 20px; padding: 40px; text-align: center; max-width: 440px; box-shadow: 0 20px 50px rgba(0,0,0,0.7); }
+                    .icon { width: 64px; height: 64px; background: rgba(99,102,241,0.2); border: 1px solid rgba(99,102,241,0.5); border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 20px; color: #818cf8; font-size: 30px; font-weight: bold; }
+                    h2 { margin: 0 0 10px; font-size: 22px; color: #fff; }
+                    p { margin: 0 0 25px; font-size: 14px; color: #9ca3af; line-height: 1.5; }
+                    .btn { display: inline-block; background: #6366f1; color: #fff; text-decoration: none; padding: 12px 28px; border-radius: 12px; font-weight: bold; font-size: 13px; transition: background 0.2s; cursor: pointer; border: none; }
+                    .btn:hover { background: #4f46e5; }
+                </style>
+            </head>
+            <body>
+                <div class="card">
+                    <div class="icon">✓</div>
+                    <h2>Steam erfolgreich verknüpft!</h2>
+                    <p>Dein Steam-Account (<strong>${steamUsername || steamId}</strong>) wurde erfolgreich mit deinem 4Ω-Konto verknüpft.</p>
+                    <button class="btn" onclick="window.close()">Fenster schließen</button>
+                </div>
+                <script>
+                    setTimeout(() => { try { window.close(); } catch(e){} }, 3000);
+                </script>
+            </body>
+            </html>
+        `);
+    } catch (err) {
+        console.error('[Steam Auth Callback] Error:', err);
+        res.status(500).send("Interner Fehler bei der Steam-Verknüpfung: " + err.message);
+    }
+});
+
+// 3. Manual Steam Account Link (Fallback / Direkteingabe)
+app.post('/api/auth/steam/manual', authenticateToken, async (req, res) => {
+    try {
+        let input = String(req.body.steamId || '').trim();
+        if (!input) return res.status(400).json({ error: 'SteamID64 oder Profil-URL erforderlich.' });
+
+        // Extract steamId if vanity or profile link passed
+        let steamId = input;
+        const profileMatch = input.match(/\/profiles\/(\d+)/);
+        if (profileMatch) {
+            steamId = profileMatch[1];
+        } else if (/^\d{17}$/.test(input)) {
+            steamId = input;
+        } else {
+            // Could be a custom vanity URL, try resolving via xml
+            const vanityMatch = input.match(/\/id\/([^\/]+)/) || [null, input];
+            const vanityName = vanityMatch[1] || input;
+            try {
+                const xmlRes = await fetch(`https://steamcommunity.com/id/${encodeURIComponent(vanityName)}?xml=1`);
+                if (xmlRes.ok) {
+                    const xmlText = await xmlRes.text();
+                    const idMatch = xmlText.match(/<steamID64>(\d+)<\/steamID64>/);
+                    if (idMatch) steamId = idMatch[1];
+                }
+            } catch (e) {}
+        }
+
+        if (!/^\d{17}$/.test(steamId)) {
+            return res.status(400).json({ error: 'Ungültige SteamID64 (muss eine 17-stellige Zahl sein).' });
+        }
+
+        // Fetch display name & avatar
+        let steamUsername = '';
+        let steamAvatar = '';
+        try {
+            const profileRes = await fetch(`https://steamcommunity.com/profiles/${steamId}?xml=1`);
+            if (profileRes.ok) {
+                const xml = await profileRes.text();
+                const nameMatch = xml.match(/<steamID><!\[CDATA\[(.*?)\]\]><\/steamID>/) || xml.match(/<steamID>(.*?)<\/steamID>/);
+                if (nameMatch) steamUsername = nameMatch[1];
+                const avMatch = xml.match(/<avatarFull><!\[CDATA\[(.*?)\]\]><\/avatarFull>/) || xml.match(/<avatarFull>(.*?)<\/avatarFull>/);
+                if (avMatch) steamAvatar = avMatch[1];
+            }
+        } catch (e) {}
+
+        const result = await db.linkSteamAccount(req.user.id, {
+            steamId,
+            steamUsername: steamUsername || steamId,
+            steamAvatar: steamAvatar || ''
+        });
+        res.json(result);
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+// 4. Steam Unlink
+app.post('/api/auth/steam/unlink', authenticateToken, async (req, res) => {
+    try {
+        await db.unlinkSteamAccount(req.user.id);
+        res.json({ success: true, message: 'Steam-Verknüpfung aufgehoben.' });
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+// 5. CS2 Inventory Endpoint
+app.get('/api/cs2/inventory/:username', async (req, res) => {
+    const targetUsername = req.params.username;
+    const forceRefresh = req.query.refresh === 'true';
+
+    try {
+        const u = await db.getUserByUsername(targetUsername);
+        if (!u) return res.status(404).json({ error: 'Nutzer nicht gefunden' });
+
+        const steamId = u.steam_id || u.steamId;
+        if (!steamId) {
+            return res.status(400).json({ error: 'no_steam', message: 'Nutzer hat keinen Steam-Account verknüpft.' });
+        }
+
+        const mode = u.cs2_inventory_mode || u.cs2InventoryMode || 'filtered';
+        const showcase = Array.isArray(u.cs2_showcase_items || u.cs2ShowcaseItems) ? (u.cs2_showcase_items || u.cs2ShowcaseItems) : [];
+
+        // Check cache (memory or DB)
+        const now = Date.now();
+        const cacheTtlMs = 30 * 60 * 1000; // 30 minutes
+        const memCache = steamInventoryMemoryCache[u.username.toLowerCase()];
+
+        if (!forceRefresh && memCache && (now - memCache.ts < cacheTtlMs)) {
+            return res.json({
+                success: true,
+                cached: true,
+                steamId,
+                steamUsername: u.steam_username || u.steamUsername || '',
+                steamAvatar: u.steam_avatar || u.steamAvatar || '',
+                mode,
+                showcaseItems: showcase,
+                items: memCache.items,
+                total: memCache.items.length
+            });
+        }
+
+        // Try DB cache if memcache missing
+        if (!forceRefresh) {
+            const dbCache = await db.getCs2InventoryCache(u.id);
+            if (dbCache && dbCache.ts && (now - dbCache.ts < cacheTtlMs) && Array.isArray(dbCache.items)) {
+                steamInventoryMemoryCache[u.username.toLowerCase()] = dbCache;
+                return res.json({
+                    success: true,
+                    cached: true,
+                    steamId,
+                    steamUsername: u.steam_username || u.steamUsername || '',
+                    steamAvatar: u.steam_avatar || u.steamAvatar || '',
+                    mode,
+                    showcaseItems: showcase,
+                    items: dbCache.items,
+                    total: dbCache.items.length
+                });
+            }
+        }
+
+        // Fetch fresh from Valve
+        try {
+            const items = await fetchValveCs2Inventory(steamId);
+            const cacheObj = { ts: now, items };
+            steamInventoryMemoryCache[u.username.toLowerCase()] = cacheObj;
+            await db.saveCs2InventoryCache(u.id, cacheObj);
+
+            res.json({
+                success: true,
+                cached: false,
+                steamId,
+                steamUsername: u.steam_username || u.steamUsername || '',
+                steamAvatar: u.steam_avatar || u.steamAvatar || '',
+                mode,
+                showcaseItems: showcase,
+                items,
+                total: items.length
+            });
+        } catch (fetchErr) {
+            // If rate limited or error, fall back to existing cache if available
+            const fallback = memCache || (await db.getCs2InventoryCache(u.id));
+            if (fallback && Array.isArray(fallback.items)) {
+                return res.json({
+                    success: true,
+                    cached: true,
+                    notice: 'Steam API temporär überlastet, zeige gecachte Daten.',
+                    steamId,
+                    steamUsername: u.steam_username || u.steamUsername || '',
+                    steamAvatar: u.steam_avatar || u.steamAvatar || '',
+                    mode,
+                    showcaseItems: showcase,
+                    items: fallback.items,
+                    total: fallback.items.length
+                });
+            }
+
+            if (fetchErr.message === 'private' || fetchErr.statusCode === 403) {
+                return res.status(403).json({
+                    error: 'private',
+                    message: 'Das Steam-Inventar dieses Nutzers ist privat (in den Steam-Datenschutzeinstellungen auf öffentlich stellen).'
+                });
+            }
+            if (fetchErr.message === 'rate_limited' || fetchErr.statusCode === 429) {
+                return res.status(429).json({
+                    error: 'rate_limited',
+                    message: 'Steam API Rate-Limit erreicht. Bitte in wenigen Minuten erneut versuchen.'
+                });
+            }
+            throw fetchErr;
+        }
+    } catch (e) {
+        console.error('[CS2 Inventory] Error:', e);
+        res.status(500).json({ error: e.message || 'Fehler beim Laden des CS2-Inventars' });
     }
 });
 

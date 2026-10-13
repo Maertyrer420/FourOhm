@@ -68,6 +68,12 @@ async function initPgTables() {
             ALTER TABLE users ADD COLUMN IF NOT EXISTS banner TEXT DEFAULT '';
             ALTER TABLE users ADD COLUMN IF NOT EXISTS audio_input_device TEXT DEFAULT 'default';
             ALTER TABLE users ADD COLUMN IF NOT EXISTS audio_output_device TEXT DEFAULT 'default';
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS steam_id TEXT DEFAULT '';
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS steam_username TEXT DEFAULT '';
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS steam_avatar TEXT DEFAULT '';
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS cs2_inventory_mode TEXT DEFAULT 'filtered';
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS cs2_showcase_items JSONB DEFAULT '[]'::jsonb;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS cs2_inventory_cache JSONB DEFAULT NULL;
 
             CREATE TABLE IF NOT EXISTS virtual_servers (
                 id TEXT PRIMARY KEY,
@@ -530,7 +536,7 @@ module.exports = {
 
     getProfile: async (userId) => {
         if (pgPool) {
-            const res = await pgPool.query('SELECT id, username, bio, avatar, ring_color, banner, audio_input_device, audio_output_device FROM users WHERE id = $1', [userId]);
+            const res = await pgPool.query('SELECT id, username, bio, avatar, ring_color, banner, audio_input_device, audio_output_device, steam_id, steam_username, steam_avatar, cs2_inventory_mode, cs2_showcase_items FROM users WHERE id = $1', [userId]);
             const row = res.rows[0];
             if (!row) throw new Error('Nutzer nicht gefunden');
             return { 
@@ -541,7 +547,12 @@ module.exports = {
                 ringColor: row.ring_color || '#00ff00',
                 banner: row.banner || '',
                 audioInputDevice: row.audio_input_device || 'default',
-                audioOutputDevice: row.audio_output_device || 'default'
+                audioOutputDevice: row.audio_output_device || 'default',
+                steamId: row.steam_id || '',
+                steamUsername: row.steam_username || '',
+                steamAvatar: row.steam_avatar || '',
+                cs2InventoryMode: row.cs2_inventory_mode || 'filtered',
+                cs2ShowcaseItems: Array.isArray(row.cs2_showcase_items) ? row.cs2_showcase_items : []
             };
         }
         const user = getLocalUsers().find(u => u.id === userId);
@@ -554,7 +565,12 @@ module.exports = {
             ringColor: user.ringColor || '#00ff00',
             banner: user.banner || '',
             audioInputDevice: user.audioInputDevice || 'default',
-            audioOutputDevice: user.audioOutputDevice || 'default'
+            audioOutputDevice: user.audioOutputDevice || 'default',
+            steamId: user.steamId || user.steam_id || '',
+            steamUsername: user.steamUsername || user.steam_username || '',
+            steamAvatar: user.steamAvatar || user.steam_avatar || '',
+            cs2InventoryMode: user.cs2InventoryMode || user.cs2_inventory_mode || 'filtered',
+            cs2ShowcaseItems: Array.isArray(user.cs2ShowcaseItems || user.cs2_showcase_items) ? (user.cs2ShowcaseItems || user.cs2_showcase_items) : []
         };
     },
 
@@ -562,13 +578,25 @@ module.exports = {
         let existing = {};
         if (pgPool) {
             try {
-                const current = await pgPool.query('SELECT bio, avatar, ring_color, banner, audio_input_device, audio_output_device FROM users WHERE id = $1', [userId]);
+                const current = await pgPool.query('SELECT bio, avatar, ring_color, banner, audio_input_device, audio_output_device, steam_id, steam_username, steam_avatar, cs2_inventory_mode, cs2_showcase_items FROM users WHERE id = $1', [userId]);
                 if (current.rows && current.rows.length > 0) existing = current.rows[0];
             } catch (e) {}
         } else {
             const users = getLocalUsers();
             const u = users.find(x => x.id === userId);
-            if (u) existing = { bio: u.bio, avatar: u.avatar, ring_color: u.ringColor || u.ring_color, banner: u.banner, audio_input_device: u.audioInputDevice, audio_output_device: u.audioOutputDevice };
+            if (u) existing = { 
+                bio: u.bio, 
+                avatar: u.avatar, 
+                ring_color: u.ringColor || u.ring_color, 
+                banner: u.banner, 
+                audio_input_device: u.audioInputDevice, 
+                audio_output_device: u.audioOutputDevice,
+                steam_id: u.steamId || u.steam_id,
+                steam_username: u.steamUsername || u.steam_username,
+                steam_avatar: u.steamAvatar || u.steam_avatar,
+                cs2_inventory_mode: u.cs2InventoryMode || u.cs2_inventory_mode,
+                cs2_showcase_items: u.cs2ShowcaseItems || u.cs2_showcase_items
+            };
         }
 
         const bio = typeof data.bio === 'string' ? data.bio.slice(0, 255) : (existing.bio || '');
@@ -577,10 +605,17 @@ module.exports = {
         const banner = typeof data.banner === 'string' ? data.banner : (existing.banner || '');
         const audioInputDevice = typeof data.audioInputDevice === 'string' ? data.audioInputDevice : (typeof data.audio_input_device === 'string' ? data.audio_input_device : (existing.audio_input_device || existing.audioInputDevice || 'default'));
         const audioOutputDevice = typeof data.audioOutputDevice === 'string' ? data.audioOutputDevice : (typeof data.audio_output_device === 'string' ? data.audio_output_device : (existing.audio_output_device || existing.audioOutputDevice || 'default'));
+        const steamId = data.steamId !== undefined ? String(data.steamId) : (data.steam_id !== undefined ? String(data.steam_id) : (existing.steam_id || ''));
+        const steamUsername = data.steamUsername !== undefined ? String(data.steamUsername) : (data.steam_username !== undefined ? String(data.steam_username) : (existing.steam_username || ''));
+        const steamAvatar = data.steamAvatar !== undefined ? String(data.steamAvatar) : (data.steam_avatar !== undefined ? String(data.steam_avatar) : (existing.steam_avatar || ''));
+        const cs2InventoryMode = data.cs2InventoryMode !== undefined ? String(data.cs2InventoryMode) : (data.cs2_inventory_mode !== undefined ? String(data.cs2_inventory_mode) : (existing.cs2_inventory_mode || 'filtered'));
+        const cs2ShowcaseItems = Array.isArray(data.cs2ShowcaseItems || data.cs2_showcase_items) ? (data.cs2ShowcaseItems || data.cs2_showcase_items) : (Array.isArray(existing.cs2_showcase_items) ? existing.cs2_showcase_items : []);
 
         if (pgPool) {
-            await pgPool.query('UPDATE users SET bio = $1, avatar = $2, ring_color = $3, banner = $4, audio_input_device = $5, audio_output_device = $6 WHERE id = $7', [bio, avatar, ringColor, banner, audioInputDevice, audioOutputDevice, userId]);
-            return { success: true, bio, avatar, ringColor, ring_color: ringColor, banner, audioInputDevice, audio_input_device: audioInputDevice, audioOutputDevice, audio_output_device: audioOutputDevice };
+            await pgPool.query('UPDATE users SET bio = $1, avatar = $2, ring_color = $3, banner = $4, audio_input_device = $5, audio_output_device = $6, steam_id = $7, steam_username = $8, steam_avatar = $9, cs2_inventory_mode = $10, cs2_showcase_items = $11 WHERE id = $12', [
+                bio, avatar, ringColor, banner, audioInputDevice, audioOutputDevice, steamId, steamUsername, steamAvatar, cs2InventoryMode, JSON.stringify(cs2ShowcaseItems), userId
+            ]);
+            return { success: true, bio, avatar, ringColor, ring_color: ringColor, banner, audioInputDevice, audio_input_device: audioInputDevice, audioOutputDevice, audio_output_device: audioOutputDevice, steamId, steam_id: steamId, steamUsername, steam_username: steamUsername, steamAvatar, steam_avatar: steamAvatar, cs2InventoryMode, cs2_inventory_mode: cs2InventoryMode, cs2ShowcaseItems, cs2_showcase_items: cs2ShowcaseItems };
         }
         const users = getLocalUsers();
         const user = users.find(u => u.id === userId);
@@ -591,9 +626,93 @@ module.exports = {
             user.banner = banner;
             user.audioInputDevice = audioInputDevice;
             user.audioOutputDevice = audioOutputDevice;
+            user.steamId = steamId;
+            user.steam_id = steamId;
+            user.steamUsername = steamUsername;
+            user.steam_username = steamUsername;
+            user.steamAvatar = steamAvatar;
+            user.steam_avatar = steamAvatar;
+            user.cs2InventoryMode = cs2InventoryMode;
+            user.cs2_inventory_mode = cs2InventoryMode;
+            user.cs2ShowcaseItems = cs2ShowcaseItems;
+            user.cs2_showcase_items = cs2ShowcaseItems;
             saveLocalUsers(users);
         }
-        return { success: true, bio, avatar, ringColor, ring_color: ringColor, banner, audioInputDevice, audio_input_device: audioInputDevice, audioOutputDevice, audio_output_device: audioOutputDevice };
+        return { success: true, bio, avatar, ringColor, ring_color: ringColor, banner, audioInputDevice, audio_input_device: audioInputDevice, audioOutputDevice, audio_output_device: audioOutputDevice, steamId, steam_id: steamId, steamUsername, steam_username: steamUsername, steamAvatar, steam_avatar: steamAvatar, cs2InventoryMode, cs2_inventory_mode: cs2InventoryMode, cs2ShowcaseItems, cs2_showcase_items: cs2ShowcaseItems };
+    },
+
+    linkSteamAccount: async (userId, { steamId, steamUsername = '', steamAvatar = '' }) => {
+        if (!userId || !steamId) throw new Error('UserId und SteamId erforderlich');
+        if (pgPool) {
+            await pgPool.query('UPDATE users SET steam_id = $1, steam_username = $2, steam_avatar = $3 WHERE id = $4', [
+                String(steamId), String(steamUsername), String(steamAvatar), userId
+            ]);
+            return { success: true, steamId, steamUsername, steamAvatar };
+        }
+        const users = getLocalUsers();
+        const user = users.find(u => u.id === userId);
+        if (user) {
+            user.steamId = String(steamId);
+            user.steam_id = String(steamId);
+            user.steamUsername = String(steamUsername);
+            user.steam_username = String(steamUsername);
+            user.steamAvatar = String(steamAvatar);
+            user.steam_avatar = String(steamAvatar);
+            saveLocalUsers(users);
+        }
+        return { success: true, steamId, steamUsername, steamAvatar };
+    },
+
+    unlinkSteamAccount: async (userId) => {
+        if (!userId) throw new Error('UserId erforderlich');
+        if (pgPool) {
+            await pgPool.query('UPDATE users SET steam_id = $1, steam_username = $2, steam_avatar = $3, cs2_inventory_cache = NULL WHERE id = $4', [
+                '', '', '', userId
+            ]);
+            return { success: true };
+        }
+        const users = getLocalUsers();
+        const user = users.find(u => u.id === userId);
+        if (user) {
+            user.steamId = '';
+            user.steam_id = '';
+            user.steamUsername = '';
+            user.steam_username = '';
+            user.steamAvatar = '';
+            user.steam_avatar = '';
+            delete user.cs2InventoryCache;
+            delete user.cs2_inventory_cache;
+            saveLocalUsers(users);
+        }
+        return { success: true };
+    },
+
+    getCs2InventoryCache: async (userIdOrUsername) => {
+        if (!userIdOrUsername) return null;
+        if (pgPool) {
+            const res = await pgPool.query('SELECT cs2_inventory_cache FROM users WHERE id = $1 OR LOWER(username) = LOWER($1)', [userIdOrUsername]);
+            return res.rows[0]?.cs2_inventory_cache || null;
+        }
+        const users = getLocalUsers();
+        const u = users.find(x => x.id === userIdOrUsername || (x.username && x.username.toLowerCase() === userIdOrUsername.toLowerCase()));
+        return u?.cs2InventoryCache || u?.cs2_inventory_cache || null;
+    },
+
+    saveCs2InventoryCache: async (userIdOrUsername, cacheData) => {
+        if (!userIdOrUsername) return;
+        if (pgPool) {
+            await pgPool.query('UPDATE users SET cs2_inventory_cache = $1 WHERE id = $2 OR LOWER(username) = LOWER($2)', [
+                JSON.stringify(cacheData), userIdOrUsername
+            ]);
+            return;
+        }
+        const users = getLocalUsers();
+        const u = users.find(x => x.id === userIdOrUsername || (x.username && x.username.toLowerCase() === userIdOrUsername.toLowerCase()));
+        if (u) {
+            u.cs2InventoryCache = cacheData;
+            u.cs2_inventory_cache = cacheData;
+            saveLocalUsers(users);
+        }
     },
 
     addDirectMessage: async (sender, receiver, msg, isMedia = false) => {
