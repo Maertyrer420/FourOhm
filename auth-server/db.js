@@ -575,12 +575,28 @@ module.exports = {
                 'SELECT sender, receiver, msg, is_media, ts FROM direct_messages WHERE (sender = $1 AND receiver = $2) OR (sender = $2 AND receiver = $1) ORDER BY ts ASC LIMIT 300',
                 [userA, userB]
             );
-            return res.rows.map(r => ({ sender: r.sender, receiver: r.receiver, text: r.msg, isMedia: r.is_media, time: Number(r.ts) }));
+            return res.rows.map(r => ({
+                sender: r.sender,
+                receiver: r.receiver,
+                text: r.msg,
+                message: r.msg,
+                isMedia: !!r.is_media,
+                time: Number(r.ts),
+                created_at: new Date(Number(r.ts)).toISOString()
+            }));
         }
         const dms = getLocalDMs();
         return dms.filter(m => (m.sender === userA && m.receiver === userB) || (m.sender === userB && m.receiver === userA))
             .slice(-300)
-            .map(m => ({ sender: m.sender, receiver: m.receiver, text: m.msg, isMedia: m.isMedia, time: m.ts }));
+            .map(m => ({
+                sender: m.sender,
+                receiver: m.receiver,
+                text: m.msg,
+                message: m.msg,
+                isMedia: !!m.isMedia,
+                time: Number(m.ts),
+                created_at: new Date(Number(m.ts)).toISOString()
+            }));
     },
 
     getSettings: async (userId) => {

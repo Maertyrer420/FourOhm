@@ -205,7 +205,7 @@ app.get('/api/profile/:username', async (req, res) => {
 app.get('/api/dm/:targetUser', authenticateToken, async (req, res) => {
     try {
         const messages = await db.getDirectMessages(req.user.username, req.params.targetUser);
-        res.json(messages);
+        res.json({ success: true, messages });
     } catch (e) {
         res.status(400).json({ error: e.message });
     }
@@ -213,8 +213,16 @@ app.get('/api/dm/:targetUser', authenticateToken, async (req, res) => {
 
 app.post('/api/dm/:targetUser', authenticateToken, async (req, res) => {
     try {
-        const msg = await db.addDirectMessage(req.user.username, req.params.targetUser, req.body.msg, req.body.isMedia);
-        res.json(msg);
+        const msgText = req.body.msg || req.body.message || '';
+        const isMedia = req.body.isMedia || false;
+        const msg = await db.addDirectMessage(req.user.username, req.params.targetUser, msgText, isMedia);
+        const ts = msg.ts || Date.now();
+        io.to('user_' + req.params.targetUser).emit('private-message', req.user.username, msgText, ts, isMedia, req.params.targetUser);
+        const toSocket = userSockets[req.params.targetUser];
+        if (toSocket) {
+            io.to(toSocket).emit('private-message', req.user.username, msgText, ts, isMedia, req.params.targetUser);
+        }
+        res.json({ success: true, message: msg });
     } catch (e) {
         res.status(400).json({ error: e.message });
     }
@@ -550,6 +558,9 @@ io.on('connection', async (socket) => {
         const srv = await db.getVirtualServer(serverId);
 
         if (username) {
+            socket.join('user_' + username);
+            userSockets[username] = socket.id;
+            onlineUsers[socket.id] = username;
             if (!srv.userGroups) srv.userGroups = {};
             // First person to join the server becomes Owner (100 Power)
             if (Object.keys(srv.userGroups).length === 0) {
@@ -577,21 +588,29 @@ io.on('connection', async (socket) => {
         if (!uName) return;
         onlineUsers[socket.id] = uName;
         userSockets[uName] = socket.id;
+        socket.join('user_' + uName);
         io.emit('online-users', Object.values(onlineUsers));
     });
 
-    socket.on('private-message', async (toUser, msg, fromName, isMedia = false) => {
+    socket.on('private-message', async (toUser, msg, explicitFromName, isMedia = false) => {
+        const fromName = explicitFromName || onlineUsers[socket.id] || socket.handshake.query.username;
+        if (!fromName || !toUser || !msg) return;
         const timestamp = Date.now();
         try {
             await db.addDirectMessage(fromName, toUser, msg, isMedia);
         } catch (e) {
             console.error('[DM] Save failed:', e.message);
         }
+
+        // Broadcast to recipient user room & direct socket
+        io.to('user_' + toUser).emit('private-message', fromName, msg, timestamp, isMedia, toUser);
         const toSocket = userSockets[toUser];
-        if (toSocket) {
-            io.to(toSocket).emit('private-message', fromName, msg, timestamp, isMedia);
+        if (toSocket && toSocket !== socket.id) {
+            io.to(toSocket).emit('private-message', fromName, msg, timestamp, isMedia, toUser);
         }
-        socket.emit('private-message-sent', toUser, msg, timestamp, isMedia);
+
+        // Acknowledge back to sender
+        socket.emit('private-message-sent', toUser, msg, timestamp, isMedia, fromName);
     });
 
     // 3. Voice & Room Channel Management:
