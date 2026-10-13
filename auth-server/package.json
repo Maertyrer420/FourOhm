@@ -1,13 +1,14 @@
 {
-  "name": "voice-server",
+  "name": "auth-server",
   "version": "1.0.0",
-  "description": "Dedicated Server for 4Ω (FourOhm)",
+  "description": "Auth Server for 4Ω (FourOhm)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
+    "cors": "^2.8.5",
     "express": "^4.21.0",
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.4.0",
