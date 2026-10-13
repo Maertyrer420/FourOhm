@@ -217,13 +217,8 @@ app.post('/api/dm/:targetUser', authenticateToken, async (req, res) => {
     try {
         const msgText = req.body.msg || req.body.message || '';
         const isMedia = req.body.isMedia || false;
-        const msg = await db.addDirectMessage(req.user.username, req.params.targetUser, msgText, isMedia);
         const ts = msg.ts || Date.now();
         io.to('user_' + req.params.targetUser).emit('private-message', req.user.username, msgText, ts, isMedia, req.params.targetUser);
-        const toSocket = userSockets[req.params.targetUser];
-        if (toSocket) {
-            io.to(toSocket).emit('private-message', req.user.username, msgText, ts, isMedia, req.params.targetUser);
-        }
         res.json({ success: true, message: msg });
     } catch (e) {
         res.status(400).json({ error: e.message });
@@ -231,8 +226,8 @@ app.post('/api/dm/:targetUser', authenticateToken, async (req, res) => {
 });
 
 // --- Settings (User Settings & Server Settings) ---
-app.get('/api/settings', async (req, res) => {
-    const serverId = req.query.serverId;
+app.get(['/api/settings', '/api/server/settings'], async (req, res) => {
+    const serverId = req.query.serverId || req.body?.serverId;
     if (serverId) {
         const srv = await db.getVirtualServer(serverId);
         return res.json(srv.settings || {});
@@ -249,8 +244,8 @@ app.get('/api/settings', async (req, res) => {
     res.json({});
 });
 
-app.post('/api/settings', async (req, res) => {
-    const serverId = req.query.serverId;
+app.post(['/api/settings', '/api/server/settings'], async (req, res) => {
+    const serverId = req.query.serverId || req.body?.serverId;
     if (serverId) {
         const srv = await db.getVirtualServer(serverId);
         srv.settings = { ...srv.settings, ...req.body };
@@ -755,12 +750,8 @@ io.on('connection', async (socket) => {
             console.error('[DM] Save failed:', e.message);
         }
 
-        // Broadcast to recipient user room & direct socket
+        // Broadcast to recipient user room
         io.to('user_' + toUser).emit('private-message', fromName, msg, timestamp, isMedia, toUser);
-        const toSocket = userSockets[toUser];
-        if (toSocket && toSocket !== socket.id) {
-            io.to(toSocket).emit('private-message', fromName, msg, timestamp, isMedia, toUser);
-        }
 
         // Acknowledge back to sender
         socket.emit('private-message-sent', toUser, msg, timestamp, isMedia, fromName);

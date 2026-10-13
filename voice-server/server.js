@@ -19,14 +19,14 @@ app.get('/health', (req, res) => {
 });
 
 // Settings
-app.get('/api/settings', async (req, res) => {
-    const srvId = req.query.serverId || 'default';
+app.get(['/api/settings', '/api/server/settings'], async (req, res) => {
+    const srvId = req.query.serverId || req.body?.serverId || 'default';
     const srv = await db.getVirtualServer(srvId);
     res.json(srv.settings || {});
 });
 
-app.post('/api/settings', async (req, res) => {
-    const srvId = req.query.serverId || 'default';
+app.post(['/api/settings', '/api/server/settings'], async (req, res) => {
+    const srvId = req.query.serverId || req.body?.serverId || 'default';
     const srv = await db.getVirtualServer(srvId);
     srv.settings = { ...srv.settings, ...req.body };
     await db.saveVirtualServer(srvId, srv);

@@ -553,10 +553,22 @@ module.exports = {
     },
 
     saveProfile: async (userId, data) => {
-        const bio = typeof data.bio === 'string' ? data.bio.slice(0, 255) : '';
-        const avatar = typeof data.avatar === 'string' ? data.avatar : '';
-        const ringColor = typeof data.ringColor === 'string' ? data.ringColor : (typeof data.ring_color === 'string' ? data.ring_color : '#00ff00');
-        const banner = typeof data.banner === 'string' ? data.banner : '';
+        let existing = {};
+        if (pgPool) {
+            try {
+                const current = await pgPool.query('SELECT bio, avatar, ring_color, banner FROM users WHERE id = $1', [userId]);
+                if (current.rows && current.rows.length > 0) existing = current.rows[0];
+            } catch (e) {}
+        } else {
+            const users = getLocalUsers();
+            const u = users.find(x => x.id === userId);
+            if (u) existing = { bio: u.bio, avatar: u.avatar, ring_color: u.ringColor || u.ring_color, banner: u.banner };
+        }
+
+        const bio = typeof data.bio === 'string' ? data.bio.slice(0, 255) : (existing.bio || '');
+        const avatar = typeof data.avatar === 'string' ? data.avatar : (existing.avatar || '');
+        const ringColor = typeof data.ringColor === 'string' ? data.ringColor : (typeof data.ring_color === 'string' ? data.ring_color : (existing.ring_color || existing.ringColor || '#00ff00'));
+        const banner = typeof data.banner === 'string' ? data.banner : (existing.banner || '');
 
         if (pgPool) {
             await pgPool.query('UPDATE users SET bio = $1, avatar = $2, ring_color = $3, banner = $4 WHERE id = $5', [bio, avatar, ringColor, banner, userId]);
