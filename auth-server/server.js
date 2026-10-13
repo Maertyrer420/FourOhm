@@ -1318,6 +1318,13 @@ io.on('connection', async (socket) => {
         io.to(currentSid).emit('user-ring-color-updated', { username: uName, ringColor });
     });
 
+    socket.on('join-text-room', (roomId) => {
+        if (!roomId) return;
+        const currentSid = serverId || 'default';
+        const roomKey = currentSid + '_' + roomId;
+        socket.join(roomKey);
+    });
+
     socket.on('chat-message', async (roomId, msg, name, isMedia) => {
         const currentSid = serverId || 'default';
         const msgObj = { senderName: name, msg, timestamp: Date.now(), isMedia };
@@ -1341,6 +1348,14 @@ io.on('connection', async (socket) => {
             io.to(targetId).emit('ice-candidate', socket.id, candidate);
         } else {
             socket.broadcast.emit('ice-candidate', socket.id, candidate);
+        }
+    });
+
+    socket.on('ping-check', (clientTimestamp, callback) => {
+        if (typeof callback === 'function') {
+            callback(clientTimestamp);
+        } else {
+            socket.emit('pong-check', clientTimestamp);
         }
     });
 

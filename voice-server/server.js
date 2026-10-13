@@ -629,12 +629,20 @@ io.on('connection', async (socket) => {
         io.to(serverId).emit('user-ring-color-updated', { username: uName, ringColor });
     });
 
+    socket.on('join-text-room', (roomId) => {
+        if (!roomId) return;
+        const roomKey = serverId + '_' + roomId;
+        socket.join(roomKey);
+    });
+
     socket.on('chat-message', async (roomId, msg, name, isMedia) => {
         const msgObj = { senderName: name, msg, timestamp: Date.now(), isMedia };
         await db.addMessage(serverId, roomId, msgObj);
 
         const roomKey = serverId + '_' + roomId;
+        // Broadcast to both channel room and whole virtual server so viewing clients receive it reliably
         io.to(roomKey).emit('chat-message', socket.id, name, msg, roomId, msgObj.timestamp);
+        io.to(serverId).emit('chat-message', socket.id, name, msg, roomId, msgObj.timestamp);
     });
 
     socket.on('offer', (targetId, offer, senderName) => {
@@ -650,6 +658,14 @@ io.on('connection', async (socket) => {
             io.to(targetId).emit('ice-candidate', socket.id, candidate);
         } else {
             socket.broadcast.emit('ice-candidate', socket.id, candidate);
+        }
+    });
+
+    socket.on('ping-check', (clientTimestamp, callback) => {
+        if (typeof callback === 'function') {
+            callback(clientTimestamp);
+        } else {
+            socket.emit('pong-check', clientTimestamp);
         }
     });
 
