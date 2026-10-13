@@ -65,6 +65,7 @@ async function initPgTables() {
             ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT '';
             ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT DEFAULT '';
             ALTER TABLE users ADD COLUMN IF NOT EXISTS ring_color TEXT DEFAULT '#00ff00';
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS banner TEXT DEFAULT '';
 
             CREATE TABLE IF NOT EXISTS virtual_servers (
                 id TEXT PRIMARY KEY,
@@ -495,7 +496,7 @@ module.exports = {
             }
             friendIds = (Array.isArray(friendIds) ? friendIds : []).filter(id => id && id !== userId);
             if (!friendIds.length) return [];
-            const friendsRes = await pgPool.query('SELECT id, username, bio, avatar, ring_color FROM users WHERE id = ANY($1)', [friendIds]);
+            const friendsRes = await pgPool.query('SELECT id, username, bio, avatar, ring_color, banner FROM users WHERE id = ANY($1)', [friendIds]);
             return friendsRes.rows
                 .filter(r => r.id !== userId)
                 .map(r => ({
@@ -503,7 +504,8 @@ module.exports = {
                     username: r.username,
                     bio: r.bio || '',
                     avatar: r.avatar || '',
-                    ringColor: r.ring_color || '#00ff00'
+                    ringColor: r.ring_color || '#00ff00',
+                    banner: r.banner || ''
                 }));
         } else {
             const users = getLocalUsers();
@@ -518,31 +520,47 @@ module.exports = {
                     username: u.username,
                     bio: u.bio || '',
                     avatar: u.avatar || '',
-                    ringColor: u.ringColor || '#00ff00'
+                    ringColor: u.ringColor || '#00ff00',
+                    banner: u.banner || ''
                 }));
         }
     },
 
     getProfile: async (userId) => {
         if (pgPool) {
-            const res = await pgPool.query('SELECT id, username, bio, avatar, ring_color FROM users WHERE id = $1', [userId]);
+            const res = await pgPool.query('SELECT id, username, bio, avatar, ring_color, banner FROM users WHERE id = $1', [userId]);
             const row = res.rows[0];
             if (!row) throw new Error('Nutzer nicht gefunden');
-            return { id: row.id, username: row.username, bio: row.bio || '', avatar: row.avatar || '', ringColor: row.ring_color || '#00ff00' };
+            return { 
+                id: row.id, 
+                username: row.username, 
+                bio: row.bio || '', 
+                avatar: row.avatar || '', 
+                ringColor: row.ring_color || '#00ff00',
+                banner: row.banner || ''
+            };
         }
         const user = getLocalUsers().find(u => u.id === userId);
         if (!user) throw new Error('Nutzer nicht gefunden');
-        return { id: user.id, username: user.username, bio: user.bio || '', avatar: user.avatar || '', ringColor: user.ringColor || '#00ff00' };
+        return { 
+            id: user.id, 
+            username: user.username, 
+            bio: user.bio || '', 
+            avatar: user.avatar || '', 
+            ringColor: user.ringColor || '#00ff00',
+            banner: user.banner || ''
+        };
     },
 
     saveProfile: async (userId, data) => {
         const bio = typeof data.bio === 'string' ? data.bio.slice(0, 255) : '';
         const avatar = typeof data.avatar === 'string' ? data.avatar : '';
-        const ringColor = typeof data.ringColor === 'string' ? data.ringColor : '#00ff00';
+        const ringColor = typeof data.ringColor === 'string' ? data.ringColor : (typeof data.ring_color === 'string' ? data.ring_color : '#00ff00');
+        const banner = typeof data.banner === 'string' ? data.banner : '';
 
         if (pgPool) {
-            await pgPool.query('UPDATE users SET bio = $1, avatar = $2, ring_color = $3 WHERE id = $4', [bio, avatar, ringColor, userId]);
-            return { bio, avatar, ringColor };
+            await pgPool.query('UPDATE users SET bio = $1, avatar = $2, ring_color = $3, banner = $4 WHERE id = $5', [bio, avatar, ringColor, banner, userId]);
+            return { success: true, bio, avatar, ringColor, ring_color: ringColor, banner };
         }
         const users = getLocalUsers();
         const user = users.find(u => u.id === userId);
@@ -550,9 +568,10 @@ module.exports = {
             user.bio = bio;
             user.avatar = avatar;
             user.ringColor = ringColor;
+            user.banner = banner;
             saveLocalUsers(users);
         }
-        return { bio, avatar, ringColor };
+        return { success: true, bio, avatar, ringColor, ring_color: ringColor, banner };
     },
 
     addDirectMessage: async (sender, receiver, msg, isMedia = false) => {

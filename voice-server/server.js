@@ -11,7 +11,8 @@ const db = require('./db');
 const powerMap = { owner: 100, admin: 75, supporter: 50, user: 5, gast: 1, banned: 0 };
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', server: '4Ohm Dedicated Voice Server', timestamp: Date.now() });
@@ -33,29 +34,119 @@ app.post('/api/settings', async (req, res) => {
 });
 
 // Channels
+function sanitizeChannels(channels) {
+    if (!Array.isArray(channels)) return [];
+    return channels.map(c => {
+        const copy = { ...c };
+        copy.hasPassword = !!copy.password;
+        delete copy.password;
+        return copy;
+    });
+}
+
 app.get('/api/channels', async (req, res) => {
     const srvId = req.query.serverId || 'default';
     const srv = await db.getVirtualServer(srvId);
-    res.json(srv.channels || []);
+    res.json(sanitizeChannels(srv.channels || []));
 });
 
 app.post('/api/channels', async (req, res) => {
-    const { name, type } = req.body;
+    const { name, type, password } = req.body;
     if (!name) return res.status(400).json({ error: 'Name is required' });
-    const srvId = req.query.serverId || 'default';
+    const srvId = req.query.serverId || req.body.serverId || 'default';
     const srv = await db.getVirtualServer(srvId);
     if (!srv.channels) srv.channels = [];
 
     const newChannel = {
         id: name.toLowerCase().replace(/\s+/g, '-') + '_' + Date.now().toString().slice(-4),
         name,
-        type: type || 'text'
+        type: type || 'text',
+        password: password ? String(password) : '',
+        hasPassword: !!password,
+        whitelist: []
     };
     srv.channels.push(newChannel);
     await db.saveVirtualServer(srvId, srv);
 
-    io.to(srvId).emit('channels-update', srv.channels);
-    res.json({ success: true, channel: newChannel, channels: srv.channels });
+    const safe = sanitizeChannels(srv.channels);
+    io.to(srvId).emit('channels-update', safe);
+    res.json({ success: true, channel: { ...newChannel, password: undefined }, channels: safe });
+});
+
+app.post('/api/channels/rename', async (req, res) => {
+    try {
+        const srvId = req.body.serverId || 'default';
+        const { oldName, newName, requestingUser } = req.body;
+        if (!oldName || !newName) return res.status(400).json({ error: 'oldName and newName required' });
+        const srv = await db.getVirtualServer(srvId);
+        const reqRole = (srv.userGroups && srv.userGroups[requestingUser]) || srv.settings?.defaultRole || 'user';
+        const reqPower = powerMap[reqRole] || 0;
+        if (reqPower < 75 && requestingUser) {
+            return res.status(403).json({ error: 'Unzureichende Berechtigung' });
+        }
+        if (!srv.channels) srv.channels = [];
+        const ch = srv.channels.find(c => c.name === oldName || c.id === oldName);
+        if (!ch) return res.status(404).json({ error: 'Kanal nicht gefunden' });
+        ch.name = newName;
+        await db.saveVirtualServer(srvId, srv);
+        const safe = sanitizeChannels(srv.channels);
+        io.to(srvId).emit('channels-update', safe);
+        res.json({ success: true, channels: safe });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/channels/verify-password', async (req, res) => {
+    try {
+        const srvId = req.body.serverId || 'default';
+        const { channelName, password, username } = req.body;
+        const srv = await db.getVirtualServer(srvId);
+        const ch = (srv.channels || []).find(c => c.name === channelName || c.id === channelName);
+        if (!ch) return res.status(404).json({ error: 'Kanal nicht gefunden' });
+        if (!ch.password) return res.json({ success: true });
+
+        // Whitelist bypass
+        if (username && Array.isArray(ch.whitelist) && ch.whitelist.includes(username)) {
+            return res.json({ success: true, whitelisted: true });
+        }
+
+        // Admin bypass
+        const reqRole = (srv.userGroups && srv.userGroups[username]) || srv.settings?.defaultRole || 'user';
+        const reqPower = powerMap[reqRole] || 0;
+        if (reqPower >= 75) {
+            return res.json({ success: true, admin: true });
+        }
+
+        if (ch.password === password) {
+            return res.json({ success: true });
+        }
+        return res.status(401).json({ success: false, error: 'Falsches Passwort' });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/channels/whitelist', async (req, res) => {
+    try {
+        const srvId = req.body.serverId || 'default';
+        const { channelName, whitelist, requestingUser } = req.body;
+        const srv = await db.getVirtualServer(srvId);
+        const reqRole = (srv.userGroups && srv.userGroups[requestingUser]) || srv.settings?.defaultRole || 'user';
+        const reqPower = powerMap[reqRole] || 0;
+        if (reqPower < 75 && requestingUser) {
+            return res.status(403).json({ error: 'Unzureichende Berechtigung' });
+        }
+        const ch = (srv.channels || []).find(c => c.name === channelName || c.id === channelName);
+        if (!ch) return res.status(404).json({ error: 'Kanal nicht gefunden' });
+        ch.whitelist = Array.isArray(whitelist) ? whitelist : [];
+        await db.saveVirtualServer(srvId, srv);
+        const safe = sanitizeChannels(srv.channels);
+        io.to(srvId).emit('channels-update', safe);
+        res.json({ success: true, channel: ch });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
 app.delete('/api/channels/:name', async (req, res) => {
@@ -69,8 +160,9 @@ app.delete('/api/channels/:name', async (req, res) => {
     if (reqPower >= 75 || !username) {
         srv.channels = (srv.channels || []).filter(c => c.name !== req.params.name);
         await db.saveVirtualServer(srvId, srv);
-        io.to(srvId).emit('channels-update', srv.channels);
-        return res.json({ success: true, channels: srv.channels });
+        const safe = sanitizeChannels(srv.channels);
+        io.to(srvId).emit('channels-update', safe);
+        return res.json({ success: true, channels: safe });
     }
     return res.status(403).json({ error: 'Insufficient power' });
 });
@@ -87,13 +179,75 @@ app.post('/api/channels/reorder', async (req, res) => {
         const reqPower = powerMap[reqRole] || 0;
 
         if (reqPower >= 75 || !requestingUser) {
-            srv.channels = channels;
+            const existingMap = new Map((srv.channels || []).map(c => [c.id || c.name, c]));
+            srv.channels = channels.map(c => {
+                const ex = existingMap.get(c.id || c.name);
+                return {
+                    ...c,
+                    password: ex?.password || c.password || '',
+                    hasPassword: !!(ex?.password || c.password),
+                    whitelist: ex?.whitelist || c.whitelist || []
+                };
+            });
             await db.saveVirtualServer(srvId, srv);
-            io.to(srvId).emit('channels-update', srv.channels);
-            return res.json({ success: true, channels: srv.channels });
+            const safe = sanitizeChannels(srv.channels);
+            io.to(srvId).emit('channels-update', safe);
+            return res.json({ success: true, channels: safe });
         }
         res.status(403).json({ error: 'Unzureichende Berechtigung zum Umordnen' });
     } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Emotes
+app.get('/api/emotes', async (req, res) => {
+    try {
+        const srvId = req.query.serverId || 'default';
+        const srv = await db.getVirtualServer(srvId);
+        res.json(srv.emotes || []);
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/emotes', async (req, res) => {
+    try {
+        const { serverId = 'default', name, imageUrl, requestingUser } = req.body;
+        if (!name || !imageUrl) return res.status(400).json({ error: 'Name und Bild erforderlich' });
+        const srv = await db.getVirtualServer(serverId);
+        const reqRole = (srv.userGroups && srv.userGroups[requestingUser]) || srv.settings?.defaultRole || 'user';
+        const reqPower = powerMap[reqRole] || 0;
+        if (reqPower < 75 && requestingUser) {
+            return res.status(403).json({ error: 'Nur Owner und Admins können Emotes hochladen' });
+        }
+        if (!srv.emotes) srv.emotes = [];
+        const cleanName = name.replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase();
+        srv.emotes = srv.emotes.filter(e => e.name !== cleanName);
+        srv.emotes.push({ name: cleanName, url: imageUrl });
+        await db.saveVirtualServer(serverId, srv);
+        io.to(serverId).emit('emotes-update', srv.emotes);
+        res.json({ success: true, emotes: srv.emotes });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.delete('/api/emotes/:name', async (req, res) => {
+    try {
+        const serverId = req.query.serverId || 'default';
+        const requestingUser = req.query.requestingUser;
+        const srv = await db.getVirtualServer(serverId);
+        const reqRole = (srv.userGroups && srv.userGroups[requestingUser]) || srv.settings?.defaultRole || 'user';
+        const reqPower = powerMap[reqRole] || 0;
+        if (reqPower < 75 && requestingUser) {
+            return res.status(403).json({ error: 'Nur Owner und Admins können Emotes löschen' });
+        }
+        srv.emotes = (srv.emotes || []).filter(e => e.name !== req.params.name);
+        await db.saveVirtualServer(serverId, srv);
+        io.to(serverId).emit('emotes-update', srv.emotes);
+        res.json({ success: true, emotes: srv.emotes });
+    } catch(e) {
         res.status(500).json({ error: e.message });
     }
 });
@@ -285,7 +439,8 @@ io.on('connection', async (socket) => {
     }
 
     socket.emit('group-update', srv.userGroups || {});
-    socket.emit('channels-update', srv.channels || []);
+    socket.emit('channels-update', sanitizeChannels(srv.channels || []));
+    socket.emit('emotes-update', srv.emotes || []);
 
     socket.on('join-room', async (roomId, peerId, userObj) => {
         const roomKey = serverId + '_' + roomId;
