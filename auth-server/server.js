@@ -363,8 +363,10 @@ app.post('/api/channels/rename', async (req, res) => {
         if (!ch) return res.status(404).json({ error: 'Kanal nicht gefunden' });
         ch.name = newName;
         await db.saveVirtualServer(serverId, srv);
+        await db.renameChannelMessages(serverId, oldName, newName);
         const safe = sanitizeChannels(srv.channels);
         io.to(serverId).emit('channels-update', safe);
+        io.to(serverId).emit('channel-renamed', { oldName, newName, channelId: ch.id });
         res.json({ success: true, channels: safe });
     } catch(e) {
         res.status(500).json({ error: e.message });
@@ -379,8 +381,8 @@ app.post('/api/channels/verify-password', async (req, res) => {
         if (!ch) return res.status(404).json({ error: 'Kanal nicht gefunden' });
         if (!ch.password) return res.json({ success: true });
 
-        // Whitelist bypass
-        if (username && Array.isArray(ch.whitelist) && ch.whitelist.includes(username)) {
+        // Whitelist bypass (case-insensitive)
+        if (username && Array.isArray(ch.whitelist) && ch.whitelist.some(u => String(u).trim().toLowerCase() === String(username).trim().toLowerCase())) {
             return res.json({ success: true, whitelisted: true });
         }
 

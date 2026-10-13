@@ -468,6 +468,23 @@ module.exports = {
         return (srv.messages && srv.messages[room]) || [];
     },
 
+    renameChannelMessages: async (serverId, oldName, newName) => {
+        serverId = serverId || 'default';
+        if (!oldName || !newName || oldName === newName) return;
+        if (pgPool) {
+            await pgPool.query('UPDATE messages SET room = $3 WHERE server_id = $1 AND room = $2', [serverId, oldName, newName]);
+        } else {
+            const srv = await module.exports.getVirtualServer(serverId);
+            if (srv.messages && srv.messages[oldName]) {
+                const oldMsgs = srv.messages[oldName] || [];
+                const existingNew = srv.messages[newName] || [];
+                srv.messages[newName] = existingNew.concat(oldMsgs);
+                delete srv.messages[oldName];
+                await module.exports.saveVirtualServer(serverId, srv);
+            }
+        }
+    },
+
     cleanupMedia: async () => {
         const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
         if (pgPool) {

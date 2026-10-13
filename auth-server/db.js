@@ -66,6 +66,8 @@ async function initPgTables() {
             ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT DEFAULT '';
             ALTER TABLE users ADD COLUMN IF NOT EXISTS ring_color TEXT DEFAULT '#00ff00';
             ALTER TABLE users ADD COLUMN IF NOT EXISTS banner TEXT DEFAULT '';
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS audio_input_device TEXT DEFAULT 'default';
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS audio_output_device TEXT DEFAULT 'default';
 
             CREATE TABLE IF NOT EXISTS virtual_servers (
                 id TEXT PRIMARY KEY,
@@ -528,7 +530,7 @@ module.exports = {
 
     getProfile: async (userId) => {
         if (pgPool) {
-            const res = await pgPool.query('SELECT id, username, bio, avatar, ring_color, banner FROM users WHERE id = $1', [userId]);
+            const res = await pgPool.query('SELECT id, username, bio, avatar, ring_color, banner, audio_input_device, audio_output_device FROM users WHERE id = $1', [userId]);
             const row = res.rows[0];
             if (!row) throw new Error('Nutzer nicht gefunden');
             return { 
@@ -537,7 +539,9 @@ module.exports = {
                 bio: row.bio || '', 
                 avatar: row.avatar || '', 
                 ringColor: row.ring_color || '#00ff00',
-                banner: row.banner || ''
+                banner: row.banner || '',
+                audioInputDevice: row.audio_input_device || 'default',
+                audioOutputDevice: row.audio_output_device || 'default'
             };
         }
         const user = getLocalUsers().find(u => u.id === userId);
@@ -548,7 +552,9 @@ module.exports = {
             bio: user.bio || '', 
             avatar: user.avatar || '', 
             ringColor: user.ringColor || '#00ff00',
-            banner: user.banner || ''
+            banner: user.banner || '',
+            audioInputDevice: user.audioInputDevice || 'default',
+            audioOutputDevice: user.audioOutputDevice || 'default'
         };
     },
 
@@ -556,23 +562,25 @@ module.exports = {
         let existing = {};
         if (pgPool) {
             try {
-                const current = await pgPool.query('SELECT bio, avatar, ring_color, banner FROM users WHERE id = $1', [userId]);
+                const current = await pgPool.query('SELECT bio, avatar, ring_color, banner, audio_input_device, audio_output_device FROM users WHERE id = $1', [userId]);
                 if (current.rows && current.rows.length > 0) existing = current.rows[0];
             } catch (e) {}
         } else {
             const users = getLocalUsers();
             const u = users.find(x => x.id === userId);
-            if (u) existing = { bio: u.bio, avatar: u.avatar, ring_color: u.ringColor || u.ring_color, banner: u.banner };
+            if (u) existing = { bio: u.bio, avatar: u.avatar, ring_color: u.ringColor || u.ring_color, banner: u.banner, audio_input_device: u.audioInputDevice, audio_output_device: u.audioOutputDevice };
         }
 
         const bio = typeof data.bio === 'string' ? data.bio.slice(0, 255) : (existing.bio || '');
         const avatar = typeof data.avatar === 'string' ? data.avatar : (existing.avatar || '');
         const ringColor = typeof data.ringColor === 'string' ? data.ringColor : (typeof data.ring_color === 'string' ? data.ring_color : (existing.ring_color || existing.ringColor || '#00ff00'));
         const banner = typeof data.banner === 'string' ? data.banner : (existing.banner || '');
+        const audioInputDevice = typeof data.audioInputDevice === 'string' ? data.audioInputDevice : (typeof data.audio_input_device === 'string' ? data.audio_input_device : (existing.audio_input_device || existing.audioInputDevice || 'default'));
+        const audioOutputDevice = typeof data.audioOutputDevice === 'string' ? data.audioOutputDevice : (typeof data.audio_output_device === 'string' ? data.audio_output_device : (existing.audio_output_device || existing.audioOutputDevice || 'default'));
 
         if (pgPool) {
-            await pgPool.query('UPDATE users SET bio = $1, avatar = $2, ring_color = $3, banner = $4 WHERE id = $5', [bio, avatar, ringColor, banner, userId]);
-            return { success: true, bio, avatar, ringColor, ring_color: ringColor, banner };
+            await pgPool.query('UPDATE users SET bio = $1, avatar = $2, ring_color = $3, banner = $4, audio_input_device = $5, audio_output_device = $6 WHERE id = $7', [bio, avatar, ringColor, banner, audioInputDevice, audioOutputDevice, userId]);
+            return { success: true, bio, avatar, ringColor, ring_color: ringColor, banner, audioInputDevice, audio_input_device: audioInputDevice, audioOutputDevice, audio_output_device: audioOutputDevice };
         }
         const users = getLocalUsers();
         const user = users.find(u => u.id === userId);
@@ -581,9 +589,11 @@ module.exports = {
             user.avatar = avatar;
             user.ringColor = ringColor;
             user.banner = banner;
+            user.audioInputDevice = audioInputDevice;
+            user.audioOutputDevice = audioOutputDevice;
             saveLocalUsers(users);
         }
-        return { success: true, bio, avatar, ringColor, ring_color: ringColor, banner };
+        return { success: true, bio, avatar, ringColor, ring_color: ringColor, banner, audioInputDevice, audio_input_device: audioInputDevice, audioOutputDevice, audio_output_device: audioOutputDevice };
     },
 
     addDirectMessage: async (sender, receiver, msg, isMedia = false) => {
@@ -834,6 +844,23 @@ module.exports = {
         }
         const srv = await module.exports.getVirtualServer(serverId);
         return (srv.messages && srv.messages[room]) || [];
+    },
+
+    renameChannelMessages: async (serverId, oldName, newName) => {
+        serverId = serverId || 'default';
+        if (!oldName || !newName || oldName === newName) return;
+        if (pgPool) {
+            await pgPool.query('UPDATE messages SET room = $3 WHERE server_id = $1 AND room = $2', [serverId, oldName, newName]);
+        } else {
+            const srv = await module.exports.getVirtualServer(serverId);
+            if (srv.messages && srv.messages[oldName]) {
+                const oldMsgs = srv.messages[oldName] || [];
+                const existingNew = srv.messages[newName] || [];
+                srv.messages[newName] = existingNew.concat(oldMsgs);
+                delete srv.messages[oldName];
+                await module.exports.saveVirtualServer(serverId, srv);
+            }
+        }
     },
 
     cleanupMedia: async () => {

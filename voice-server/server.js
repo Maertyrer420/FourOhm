@@ -18,19 +18,69 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', server: '4Ohm Dedicated Voice Server', timestamp: Date.now() });
 });
 
-// Settings
+// In-memory profile cache for fast user lookup
+const cachedUserProfiles = {};
+
+// Profile Route
+app.get('/api/profile/:username', async (req, res) => {
+    const uName = req.params.username;
+    if (cachedUserProfiles[uName]) {
+        return res.json(cachedUserProfiles[uName]);
+    }
+    // Search connected rooms
+    for (const roomKey in rooms) {
+        for (const sockId in rooms[roomKey]) {
+            const u = rooms[roomKey][sockId];
+            if (u && u.name && u.name.toLowerCase() === uName.toLowerCase()) {
+                const prof = {
+                    username: u.name,
+                    avatar: u.avatar || '',
+                    banner: u.banner || '',
+                    bio: u.bio || '',
+                    ringColor: u.ringColor || u.ring_color || '#00ff00',
+                    role: u.groupId || 'user'
+                };
+                cachedUserProfiles[u.name] = prof;
+                return res.json(prof);
+            }
+        }
+    }
+    res.status(404).json({ error: 'Nutzer nicht gefunden' });
+});
+
+// Settings & Server Meta
 app.get(['/api/settings', '/api/server/settings'], async (req, res) => {
     const srvId = req.query.serverId || req.body?.serverId || 'default';
     const srv = await db.getVirtualServer(srvId);
-    res.json(srv.settings || {});
+    res.json({
+        ...(srv.settings || {}),
+        serverName: srv.name || srv.settings?.serverName || 'Server',
+        icon: srv.icon || srv.settings?.icon || ''
+    });
 });
 
 app.post(['/api/settings', '/api/server/settings'], async (req, res) => {
     const srvId = req.query.serverId || req.body?.serverId || 'default';
     const srv = await db.getVirtualServer(srvId);
+    const { serverName, icon } = req.body;
+    if (serverName && typeof serverName === 'string') {
+        srv.name = serverName.trim();
+        if (!srv.settings) srv.settings = {};
+        srv.settings.serverName = srv.name;
+    }
+    if (icon !== undefined) {
+        srv.icon = icon;
+        if (!srv.settings) srv.settings = {};
+        srv.settings.icon = icon;
+    }
     srv.settings = { ...srv.settings, ...req.body };
     await db.saveVirtualServer(srvId, srv);
-    res.json({ success: true, settings: srv.settings });
+    io.to(srvId).emit('server-info-updated', {
+        serverId: srvId,
+        name: srv.name || srv.settings?.serverName || 'Server',
+        icon: srv.icon || srv.settings?.icon || ''
+    });
+    res.json({ success: true, settings: srv.settings, serverName: srv.name, icon: srv.icon });
 });
 
 // Channels
@@ -89,8 +139,10 @@ app.post('/api/channels/rename', async (req, res) => {
         if (!ch) return res.status(404).json({ error: 'Kanal nicht gefunden' });
         ch.name = newName;
         await db.saveVirtualServer(srvId, srv);
+        await db.renameChannelMessages(srvId, oldName, newName);
         const safe = sanitizeChannels(srv.channels);
         io.to(srvId).emit('channels-update', safe);
+        io.to(srvId).emit('channel-renamed', { oldName, newName, channelId: ch.id });
         res.json({ success: true, channels: safe });
     } catch(e) {
         res.status(500).json({ error: e.message });
@@ -106,8 +158,8 @@ app.post('/api/channels/verify-password', async (req, res) => {
         if (!ch) return res.status(404).json({ error: 'Kanal nicht gefunden' });
         if (!ch.password) return res.json({ success: true });
 
-        // Whitelist bypass
-        if (username && Array.isArray(ch.whitelist) && ch.whitelist.includes(username)) {
+        // Whitelist bypass (case-insensitive)
+        if (username && Array.isArray(ch.whitelist) && ch.whitelist.some(u => String(u).trim().toLowerCase() === String(username).trim().toLowerCase())) {
             return res.json({ success: true, whitelisted: true });
         }
 
@@ -441,6 +493,11 @@ io.on('connection', async (socket) => {
     socket.emit('group-update', srv.userGroups || {});
     socket.emit('channels-update', sanitizeChannels(srv.channels || []));
     socket.emit('emotes-update', srv.emotes || []);
+    socket.emit('server-info-updated', {
+        serverId,
+        name: srv.name || srv.settings?.serverName || 'Server',
+        icon: srv.icon || srv.settings?.icon || ''
+    });
 
     socket.on('join-room', async (roomId, peerId, userObj) => {
         const roomKey = serverId + '_' + roomId;
@@ -451,13 +508,25 @@ io.on('connection', async (socket) => {
         const uName = (userObj && userObj.name) || peerId || username || 'Gast';
         const role = (srvData.userGroups && srvData.userGroups[uName]) || srvData.settings?.defaultRole || 'user';
 
-        rooms[roomKey][socket.id] = {
+        const member = {
             socketId: socket.id,
             peerId,
             name: uName,
             groupId: role,
             ...(typeof userObj === 'object' ? userObj : {})
         };
+        rooms[roomKey][socket.id] = member;
+
+        if (uName) {
+            cachedUserProfiles[uName] = {
+                username: uName,
+                avatar: member.avatar || '',
+                banner: member.banner || '',
+                bio: member.bio || '',
+                ringColor: member.ringColor || member.ring_color || '#00ff00',
+                role: role
+            };
+        }
 
         socket.to(roomKey).emit('user-connected', socket.id, peerId, rooms[roomKey][socket.id]);
         io.to(serverId).emit('room-users-update', roomId, Object.values(rooms[roomKey]));
