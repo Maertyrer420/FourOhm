@@ -211,36 +211,11 @@ app.get('/api/profile/:username', async (req, res) => {
 // --- Steam & CS2 Inventory Helper & Endpoints ---
 const steamInventoryMemoryCache = {}; // username -> { ts: timestamp, items: [...] }
 
-async function fetchValveCs2Inventory(steamId) {
-    if (!steamId) throw new Error('SteamID fehlt.');
-    const url = `https://steamcommunity.com/inventory/${encodeURIComponent(steamId)}/730/2?l=german&count=2000`;
-    const res = await fetch(url, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Referer': 'https://steamcommunity.com/'
-        }
-    });
-
-    if (res.status === 401 || res.status === 403) {
-        const err = new Error('private');
-        err.statusCode = 403;
-        throw err;
-    }
-    if (res.status === 429) {
-        const err = new Error('rate_limited');
-        err.statusCode = 429;
-        throw err;
-    }
-    if (!res.ok) {
-        throw new Error(`Steam API Fehler: HTTP ${res.status}`);
-    }
-
-    const data = await res.json();
+function parseValveInventoryDescriptions(data, steamId) {
     if (!data || !data.descriptions) {
         return [];
     }
 
-    // Map descriptions by classid_instanceid
     const descMap = {};
     for (const d of data.descriptions) {
         const key = `${d.classid}_${d.instanceid || '0'}`;
@@ -331,21 +306,50 @@ async function fetchValveCs2Inventory(steamId) {
     return items;
 }
 
+async function fetchValveCs2Inventory(steamId) {
+    if (!steamId) throw new Error('SteamID fehlt.');
+    const url = `https://steamcommunity.com/inventory/${encodeURIComponent(steamId)}/730/2?l=german&count=2000`;
+    const res = await fetch(url, {
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Referer': 'https://steamcommunity.com/'
+        }
+    });
+
+    if (res.status === 401 || res.status === 403) {
+        const err = new Error('private');
+        err.statusCode = 403;
+        throw err;
+    }
+    if (res.status === 429) {
+        const err = new Error('rate_limited');
+        err.statusCode = 429;
+        throw err;
+    }
+    if (!res.ok) {
+        throw new Error(`Steam API Fehler: HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+    return parseValveInventoryDescriptions(data, steamId);
+}
+
 // 1. Steam OpenID Login Initiation
 app.get('/api/auth/steam', (req, res) => {
     const userToken = req.query.token;
     if (!userToken) return res.status(400).send("Fehlendes Authentifizierungs-Token.");
 
-    const host = req.get('host');
-    const protocol = req.protocol === 'https' || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+    const host = (req.headers['x-forwarded-host'] || req.get('host') || 'fourohm-auth.onrender.com').split(',')[0].trim();
+    const protocol = (req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
     const baseUrl = `${protocol}://${host}`;
+    const realm = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
     const returnTo = `${baseUrl}/api/auth/steam/callback?token=${encodeURIComponent(userToken)}`;
 
     const params = new URLSearchParams({
         'openid.ns': 'http://specs.openid.net/auth/2.0',
         'openid.mode': 'checkid_setup',
         'openid.return_to': returnTo,
-        'openid.realm': baseUrl,
+        'openid.realm': realm,
         'openid.identity': 'http://specs.openid.net/auth/2.0/identifier_select',
         'openid.claimed_id': 'http://specs.openid.net/auth/2.0/identifier_select'
     });
@@ -366,8 +370,13 @@ app.get('/api/auth/steam/callback', async (req, res) => {
             return res.status(401).send("Sitzung abgelaufen. Bitte versuche es erneut in 4Ω.");
         }
 
-        // Verify OpenID signature directly with Steam
-        const verifyParams = new URLSearchParams(req.query);
+        // Verify OpenID signature directly with Steam (send only openid.* params)
+        const verifyParams = new URLSearchParams();
+        for (const [key, val] of Object.entries(req.query)) {
+            if (key.startsWith('openid.')) {
+                verifyParams.set(key, val);
+            }
+        }
         verifyParams.set('openid.mode', 'check_authentication');
 
         const verifyRes = await fetch('https://steamcommunity.com/openid/login', {
@@ -378,11 +387,12 @@ app.get('/api/auth/steam/callback', async (req, res) => {
         const verifyText = await verifyRes.text();
 
         if (!verifyText.includes('is_valid:true')) {
+            console.warn('[Steam Auth Callback] check_authentication failed:', verifyText);
             return res.status(400).send("Steam-Validierung fehlgeschlagen.");
         }
 
-        const claimedId = req.query['openid.claimed_id'] || '';
-        const match = claimedId.match(/\/id\/(\d+)/);
+        const claimedId = req.query['openid.claimed_id'] || req.query['openid.identity'] || '';
+        const match = claimedId.match(/\/id\/(\d+)/) || claimedId.match(/(\d{17})/);
         if (!match || !match[1]) {
             return res.status(400).send("SteamID konnte nicht ermittelt werden.");
         }
@@ -609,6 +619,8 @@ app.get('/api/cs2/inventory/:username', async (req, res) => {
             if (fetchErr.message === 'rate_limited' || fetchErr.statusCode === 429) {
                 return res.status(429).json({
                     error: 'rate_limited',
+                    steamId,
+                    steamUsername: u.steam_username || u.steamUsername || '',
                     message: 'Steam API Rate-Limit erreicht. Bitte in wenigen Minuten erneut versuchen.'
                 });
             }
@@ -617,6 +629,43 @@ app.get('/api/cs2/inventory/:username', async (req, res) => {
     } catch (e) {
         console.error('[CS2 Inventory] Error:', e);
         res.status(500).json({ error: e.message || 'Fehler beim Laden des CS2-Inventars' });
+    }
+});
+
+// 6. CS2 Inventory Client Sync (Workaround for Datacenter IP 429 rate limits)
+app.post('/api/cs2/inventory/sync', async (req, res) => {
+    try {
+        const { username, rawData } = req.body;
+        if (!username || !rawData) return res.status(400).json({ error: 'Parameter fehlen' });
+
+        const u = await db.getUserByUsername(username);
+        if (!u) return res.status(404).json({ error: 'Nutzer nicht gefunden' });
+
+        const steamId = u.steam_id || u.steamId;
+        if (!steamId) return res.status(400).json({ error: 'Kein Steam-Account verknüpft' });
+
+        const items = parseValveInventoryDescriptions(rawData, steamId);
+        const cacheObj = { ts: Date.now(), items };
+        steamInventoryMemoryCache[u.username.toLowerCase()] = cacheObj;
+        await db.saveCs2InventoryCache(u.id, cacheObj);
+
+        const mode = u.cs2_inventory_mode || u.cs2InventoryMode || 'filtered';
+        const showcase = Array.isArray(u.cs2_showcase_items || u.cs2ShowcaseItems) ? (u.cs2_showcase_items || u.cs2ShowcaseItems) : [];
+
+        res.json({
+            success: true,
+            cached: false,
+            steamId,
+            steamUsername: u.steam_username || u.steamUsername || '',
+            steamAvatar: u.steam_avatar || u.steamAvatar || '',
+            mode,
+            showcaseItems: showcase,
+            items,
+            total: items.length
+        });
+    } catch(e) {
+        console.error('[CS2 Inventory Sync Error]:', e);
+        res.status(500).json({ error: e.message });
     }
 });
 

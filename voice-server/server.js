@@ -65,6 +65,21 @@ app.get('/api/cs2/inventory/:username', async (req, res) => {
     }
 });
 
+app.post('/api/cs2/inventory/sync', async (req, res) => {
+    const authUrl = process.env.AUTH_SERVER_URL || 'https://fourohm-auth.onrender.com';
+    try {
+        const response = await fetch(`${authUrl}/api/cs2/inventory/sync`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(req.body)
+        });
+        const data = await response.json();
+        return res.status(response.status).json(data);
+    } catch (e) {
+        return res.status(500).json({ error: e.message });
+    }
+});
+
 // Settings & Server Meta
 app.get(['/api/settings', '/api/server/settings'], async (req, res) => {
     const srvId = req.query.serverId || req.body?.serverId || 'default';
