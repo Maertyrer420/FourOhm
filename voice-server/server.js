@@ -121,6 +121,9 @@ function sanitizeChannels(channels) {
     return channels.map(c => {
         const copy = { ...c };
         copy.hasPassword = !!copy.password;
+        copy.userLimit = c.userLimit ? Number(c.userLimit) : 0;
+        copy.isHub = !!c.isHub;
+        copy.isTemp = !!c.isTemp;
         delete copy.password;
         return copy;
     });
@@ -133,7 +136,7 @@ app.get('/api/channels', async (req, res) => {
 });
 
 app.post('/api/channels', async (req, res) => {
-    const { name, type, password } = req.body;
+    const { name, type, password, userLimit, isHub } = req.body;
     if (!name) return res.status(400).json({ error: 'Name is required' });
     const srvId = req.query.serverId || req.body.serverId || 'default';
     const srv = await db.getVirtualServer(srvId);
@@ -145,6 +148,8 @@ app.post('/api/channels', async (req, res) => {
         type: type || 'text',
         password: password ? String(password) : '',
         hasPassword: !!password,
+        userLimit: userLimit ? Math.max(0, parseInt(userLimit, 10)) : 0,
+        isHub: !!isHub,
         whitelist: []
     };
     srv.channels.push(newChannel);
@@ -531,14 +536,61 @@ io.on('connection', async (socket) => {
         icon: srv.icon || srv.settings?.icon || ''
     });
 
+    async function cleanupEmptyTempChannels(sId, rId) {
+        const rKey = sId + '_' + rId;
+        if (!rooms[rKey] || Object.keys(rooms[rKey]).length === 0) {
+            const srv = await db.getVirtualServer(sId);
+            if (srv && srv.channels) {
+                const idx = srv.channels.findIndex(c => (c.name === rId || c.id === rId) && c.isTemp);
+                if (idx > -1) {
+                    srv.channels.splice(idx, 1);
+                    await db.saveVirtualServer(sId, srv);
+                    io.to(sId).emit('channels-update', sanitizeChannels(srv.channels));
+                }
+            }
+        }
+    }
+
     socket.on('join-room', async (roomId, peerId, userObj) => {
         const roomKey = serverId + '_' + roomId;
-        socket.join(roomKey);
-        if (!rooms[roomKey]) rooms[roomKey] = {};
-
         const srvData = await db.getVirtualServer(serverId);
         const uName = (userObj && userObj.name) || peerId || username || 'Gast';
         const role = (srvData.userGroups && srvData.userGroups[uName]) || srvData.settings?.defaultRole || 'user';
+        const reqPower = powerMap[role] || 0;
+
+        const channels = srvData.channels || [];
+        const ch = channels.find(c => c.name === roomId || c.id === roomId);
+
+        // 1. Hub Channel Handler (Join-to-Create)
+        if (ch && ch.isHub) {
+            const tempId = 'temp_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+            const tempName = `🔊 ${uName}'s Kanal`;
+            const tempChannel = {
+                id: tempId,
+                name: tempName,
+                type: 'voice',
+                isTemp: true,
+                creator: uName,
+                userLimit: ch.userLimit || 0
+            };
+            srvData.channels.push(tempChannel);
+            await db.saveVirtualServer(serverId, srvData);
+            io.to(serverId).emit('channels-update', sanitizeChannels(srvData.channels));
+            socket.emit('redirect-to-room', { newRoomId: tempName, newRoomName: tempName });
+            return;
+        }
+
+        // 2. User Limit Check
+        if (ch && ch.userLimit > 0) {
+            const currentCount = rooms[roomKey] ? Object.keys(rooms[roomKey]).length : 0;
+            if ((!rooms[roomKey] || !rooms[roomKey][socket.id]) && currentCount >= ch.userLimit && reqPower < 75) {
+                socket.emit('channel-full', { roomId, limit: ch.userLimit });
+                return;
+            }
+        }
+
+        socket.join(roomKey);
+        if (!rooms[roomKey]) rooms[roomKey] = {};
 
         const member = {
             socketId: socket.id,
@@ -564,13 +616,14 @@ io.on('connection', async (socket) => {
         io.to(serverId).emit('room-users-update', roomId, Object.values(rooms[roomKey]));
     });
 
-    socket.on('leave-room', (roomId) => {
+    socket.on('leave-room', async (roomId) => {
         const roomKey = serverId + '_' + roomId;
         if (rooms[roomKey] && rooms[roomKey][socket.id]) {
             delete rooms[roomKey][socket.id];
             socket.to(roomKey).emit('user-disconnected', socket.id);
             socket.leave(roomKey);
             io.to(serverId).emit('room-users-update', roomId, Object.values(rooms[roomKey]));
+            await cleanupEmptyTempChannels(serverId, roomId);
         }
     });
 
@@ -636,13 +689,40 @@ io.on('connection', async (socket) => {
     });
 
     socket.on('chat-message', async (roomId, msg, name, isMedia) => {
-        const msgObj = { senderName: name, msg, timestamp: Date.now(), isMedia };
-        await db.addMessage(serverId, roomId, msgObj);
+        const msgObj = {
+            id: 'msg_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
+            senderName: name,
+            msg,
+            timestamp: Date.now(),
+            isMedia: !!isMedia,
+            edited: false,
+            reactions: {}
+        };
+        const saved = await db.addMessage(serverId, roomId, msgObj);
+        const finalId = (saved && saved.id) || msgObj.id;
 
         const roomKey = serverId + '_' + roomId;
-        // Broadcast to both channel room and whole virtual server so viewing clients receive it reliably
-        io.to(roomKey).emit('chat-message', socket.id, name, msg, roomId, msgObj.timestamp);
-        io.to(serverId).emit('chat-message', socket.id, name, msg, roomId, msgObj.timestamp);
+        io.to(roomKey).emit('chat-message', socket.id, name, msg, roomId, msgObj.timestamp, finalId, {}, false);
+        io.to(serverId).emit('chat-message', socket.id, name, msg, roomId, msgObj.timestamp, finalId, {}, false);
+    });
+
+    socket.on('edit-message', async ({ roomId, messageId, newText }) => {
+        if (!roomId || !messageId || !newText) return;
+        await db.editMessage(serverId, roomId, messageId, newText);
+        io.to(serverId).emit('message-edited', { roomId, messageId, newText, timestamp: Date.now() });
+    });
+
+    socket.on('delete-message', async ({ roomId, messageId }) => {
+        if (!roomId || !messageId) return;
+        await db.deleteMessage(serverId, roomId, messageId);
+        io.to(serverId).emit('message-deleted', { roomId, messageId, timestamp: Date.now() });
+    });
+
+    socket.on('toggle-reaction', async ({ roomId, messageId, emoji, username: reactingUser }) => {
+        const uName = reactingUser || username;
+        if (!roomId || !messageId || !emoji || !uName) return;
+        const updated = await db.updateReaction(serverId, roomId, messageId, emoji, uName);
+        io.to(serverId).emit('reaction-updated', { roomId, messageId, reactions: updated });
     });
 
     socket.on('offer', (targetId, offer, senderName) => {
@@ -669,7 +749,7 @@ io.on('connection', async (socket) => {
         }
     });
 
-    socket.on('disconnect', () => {
+    socket.on('disconnect', async () => {
         for (const roomKey in rooms) {
             if (rooms[roomKey][socket.id]) {
                 delete rooms[roomKey][socket.id];
@@ -677,6 +757,7 @@ io.on('connection', async (socket) => {
                 const [sid, ...parts] = roomKey.split('_');
                 const rId = parts.join('_');
                 io.to(sid).emit('room-users-update', rId, Object.values(rooms[roomKey]));
+                await cleanupEmptyTempChannels(sid, rId);
             }
         }
     });

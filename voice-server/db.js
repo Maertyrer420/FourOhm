@@ -59,6 +59,8 @@ async function initPgTables() {
                 ts BIGINT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_messages_room ON messages (server_id, room, ts);
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited BOOLEAN DEFAULT false;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS reactions JSONB DEFAULT '{}'::jsonb;
         `);
         console.log('[DB] PostgreSQL tables ready');
     } catch (e) {
@@ -443,9 +445,28 @@ module.exports = {
     // --- Chat Messages ---
     addMessage: async (serverId, room, msgObj) => {
         serverId = serverId || 'default';
+        if (!msgObj.id) {
+            msgObj.id = 'msg_' + (msgObj.timestamp || Date.now()) + '_' + Math.random().toString(36).substr(2, 6);
+        }
         if (pgPool) {
-            await pgPool.query('INSERT INTO messages (server_id, room, sender, msg, is_media, ts) VALUES ($1,$2,$3,$4,$5,$6)',
-                [serverId, room, msgObj.senderName, msgObj.msg, !!msgObj.isMedia, msgObj.timestamp]);
+            try {
+                const res = await pgPool.query(
+                    'INSERT INTO messages (server_id, room, sender, msg, is_media, ts, edited, reactions) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id',
+                    [serverId, room, msgObj.senderName, msgObj.msg, !!msgObj.isMedia, msgObj.timestamp || Date.now(), !!msgObj.edited, JSON.stringify(msgObj.reactions || {})]
+                );
+                if (res.rows && res.rows[0]) {
+                    msgObj.id = String(res.rows[0].id);
+                }
+            } catch (e) {
+                // Fallback without new columns in case of table schema delay
+                const fallbackRes = await pgPool.query(
+                    'INSERT INTO messages (server_id, room, sender, msg, is_media, ts) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id',
+                    [serverId, room, msgObj.senderName, msgObj.msg, !!msgObj.isMedia, msgObj.timestamp || Date.now()]
+                );
+                if (fallbackRes.rows && fallbackRes.rows[0]) {
+                    msgObj.id = String(fallbackRes.rows[0].id);
+                }
+            }
         } else {
             const srv = await module.exports.getVirtualServer(serverId);
             if (!srv.messages) srv.messages = {};
@@ -454,18 +475,144 @@ module.exports = {
             if (srv.messages[room].length > MAX_HISTORY) srv.messages[room] = srv.messages[room].slice(-MAX_HISTORY);
             await module.exports.saveVirtualServer(serverId, srv);
         }
+        return msgObj;
     },
 
     getMessages: async (serverId, room) => {
         serverId = serverId || 'default';
         if (pgPool) {
-            const res = await pgPool.query(
-                'SELECT sender, msg, is_media, ts FROM (SELECT * FROM messages WHERE server_id = $1 AND room = $2 ORDER BY ts DESC LIMIT $3) t ORDER BY ts ASC',
-                [serverId, room, MAX_HISTORY]);
-            return res.rows.map(r => ({ senderName: r.sender, msg: r.msg, isMedia: r.is_media, timestamp: Number(r.ts) }));
+            try {
+                const res = await pgPool.query(
+                    'SELECT id, sender, msg, is_media, ts, edited, reactions FROM (SELECT * FROM messages WHERE server_id = $1 AND room = $2 ORDER BY ts DESC LIMIT $3) t ORDER BY ts ASC',
+                    [serverId, room, MAX_HISTORY]);
+                return res.rows.map(r => {
+                    let reacs = {};
+                    if (r.reactions) {
+                        try { reacs = typeof r.reactions === 'string' ? JSON.parse(r.reactions) : r.reactions; } catch (e) { reacs = {}; }
+                    }
+                    return {
+                        id: String(r.id),
+                        senderName: r.sender,
+                        msg: r.msg,
+                        isMedia: r.is_media,
+                        timestamp: Number(r.ts),
+                        edited: !!r.edited,
+                        reactions: reacs || {}
+                    };
+                });
+            } catch (e) {
+                const res = await pgPool.query(
+                    'SELECT id, sender, msg, is_media, ts FROM (SELECT * FROM messages WHERE server_id = $1 AND room = $2 ORDER BY ts DESC LIMIT $3) t ORDER BY ts ASC',
+                    [serverId, room, MAX_HISTORY]);
+                return res.rows.map(r => ({
+                    id: String(r.id),
+                    senderName: r.sender,
+                    msg: r.msg,
+                    isMedia: r.is_media,
+                    timestamp: Number(r.ts),
+                    edited: false,
+                    reactions: {}
+                }));
+            }
         }
         const srv = await module.exports.getVirtualServer(serverId);
         return (srv.messages && srv.messages[room]) || [];
+    },
+
+    editMessage: async (serverId, room, messageId, newText) => {
+        serverId = serverId || 'default';
+        if (pgPool) {
+            const numId = parseInt(messageId, 10);
+            if (!isNaN(numId)) {
+                await pgPool.query('UPDATE messages SET msg = $1, edited = true WHERE server_id = $2 AND room = $3 AND id = $4', [newText, serverId, room, numId]);
+            } else {
+                await pgPool.query('UPDATE messages SET msg = $1, edited = true WHERE server_id = $2 AND room = $3 AND ts = $4', [newText, serverId, room, Number(messageId)]);
+            }
+        } else {
+            const srv = await module.exports.getVirtualServer(serverId);
+            if (srv.messages && srv.messages[room]) {
+                const m = srv.messages[room].find(x => String(x.id) === String(messageId) || String(x.timestamp) === String(messageId));
+                if (m) {
+                    m.msg = newText;
+                    m.edited = true;
+                    await module.exports.saveVirtualServer(serverId, srv);
+                }
+            }
+        }
+    },
+
+    deleteMessage: async (serverId, room, messageId) => {
+        serverId = serverId || 'default';
+        if (pgPool) {
+            const numId = parseInt(messageId, 10);
+            if (!isNaN(numId)) {
+                await pgPool.query('DELETE FROM messages WHERE server_id = $1 AND room = $2 AND id = $3', [serverId, room, numId]);
+            } else {
+                await pgPool.query('DELETE FROM messages WHERE server_id = $1 AND room = $2 AND ts = $3', [serverId, room, Number(messageId)]);
+            }
+        } else {
+            const srv = await module.exports.getVirtualServer(serverId);
+            if (srv.messages && srv.messages[room]) {
+                srv.messages[room] = srv.messages[room].filter(x => String(x.id) !== String(messageId) && String(x.timestamp) !== String(messageId));
+                await module.exports.saveVirtualServer(serverId, srv);
+            }
+        }
+    },
+
+    updateReaction: async (serverId, room, messageId, emoji, username) => {
+        serverId = serverId || 'default';
+        let updatedReactions = {};
+        if (pgPool) {
+            try {
+                const numId = parseInt(messageId, 10);
+                const query = !isNaN(numId) 
+                    ? 'SELECT reactions FROM messages WHERE server_id = $1 AND room = $2 AND id = $3'
+                    : 'SELECT reactions FROM messages WHERE server_id = $1 AND room = $2 AND ts = $3';
+                const param = !isNaN(numId) ? numId : Number(messageId);
+                const res = await pgPool.query(query, [serverId, room, param]);
+                if (res.rows && res.rows[0]) {
+                    let r = res.rows[0].reactions;
+                    if (typeof r === 'string') {
+                        try { r = JSON.parse(r); } catch (e) { r = {}; }
+                    }
+                    r = r || {};
+                    if (!r[emoji]) r[emoji] = [];
+                    const idx = r[emoji].indexOf(username);
+                    if (idx > -1) {
+                        r[emoji].splice(idx, 1);
+                        if (r[emoji].length === 0) delete r[emoji];
+                    } else {
+                        r[emoji].push(username);
+                    }
+                    updatedReactions = r;
+                    const updateQ = !isNaN(numId)
+                        ? 'UPDATE messages SET reactions = $1 WHERE server_id = $2 AND room = $3 AND id = $4'
+                        : 'UPDATE messages SET reactions = $1 WHERE server_id = $2 AND room = $3 AND ts = $4';
+                    await pgPool.query(updateQ, [JSON.stringify(r), serverId, room, param]);
+                }
+            } catch (e) {
+                console.warn('[DB] Reaction update error:', e.message);
+            }
+        } else {
+            const srv = await module.exports.getVirtualServer(serverId);
+            if (srv.messages && srv.messages[room]) {
+                const m = srv.messages[room].find(x => String(x.id) === String(messageId) || String(x.timestamp) === String(messageId));
+                if (m) {
+                    if (!m.reactions) m.reactions = {};
+                    if (!m.reactions[emoji]) m.reactions[emoji] = [];
+                    const idx = m.reactions[emoji].indexOf(username);
+                    if (idx > -1) {
+                        m.reactions[emoji].splice(idx, 1);
+                        if (m.reactions[emoji].length === 0) delete m.reactions[emoji];
+                    } else {
+                        m.reactions[emoji].push(username);
+                    }
+                    updatedReactions = m.reactions;
+                    await module.exports.saveVirtualServer(serverId, srv);
+                }
+            }
+        }
+        return updatedReactions;
     },
 
     renameChannelMessages: async (serverId, oldName, newName) => {
