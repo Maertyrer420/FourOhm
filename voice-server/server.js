@@ -43,7 +43,8 @@ app.get('/api/profile/:username', async (req, res) => {
                     steamUsername: u.steamUsername || u.steam_username || '',
                     steamAvatar: u.steamAvatar || u.steam_avatar || '',
                     cs2InventoryMode: u.cs2InventoryMode || u.cs2_inventory_mode || 'filtered',
-                    cs2ShowcaseItems: Array.isArray(u.cs2ShowcaseItems || u.cs2_showcase_items) ? (u.cs2ShowcaseItems || u.cs2_showcase_items) : []
+                    cs2ShowcaseItems: Array.isArray(u.cs2ShowcaseItems || u.cs2_showcase_items) ? (u.cs2ShowcaseItems || u.cs2_showcase_items) : [],
+                    currentGame: u.currentGame || null
                 };
                 cachedUserProfiles[u.name] = prof;
                 return res.json(prof);
@@ -597,6 +598,7 @@ io.on('connection', async (socket) => {
             peerId,
             name: uName,
             groupId: role,
+            currentGame: (userObj && userObj.currentGame) ? String(userObj.currentGame).trim().slice(0, 60) : null,
             ...(typeof userObj === 'object' ? userObj : {})
         };
         rooms[roomKey][socket.id] = member;
@@ -608,7 +610,8 @@ io.on('connection', async (socket) => {
                 banner: member.banner || '',
                 bio: member.bio || '',
                 ringColor: member.ringColor || member.ring_color || '#00ff00',
-                role: role
+                role: role,
+                currentGame: member.currentGame || null
             };
         }
 
@@ -682,6 +685,26 @@ io.on('connection', async (socket) => {
         io.to(serverId).emit('user-ring-color-updated', { username: uName, ringColor });
     });
 
+    socket.on('user-game-status', ({ game, username: explicitUser }) => {
+        const uName = explicitUser || username;
+        const cleanGame = game ? String(game).trim().slice(0, 60) : null;
+        for (const roomKey in rooms) {
+            if (rooms[roomKey][socket.id]) {
+                rooms[roomKey][socket.id].currentGame = cleanGame;
+                const [sid, ...parts] = roomKey.split('_');
+                const rId = parts.join('_');
+                io.to(sid).emit('room-users-update', rId, Object.values(rooms[roomKey]));
+            }
+        }
+        if (uName) {
+            if (!cachedUserProfiles[uName]) {
+                cachedUserProfiles[uName] = { username: uName };
+            }
+            cachedUserProfiles[uName].currentGame = cleanGame;
+        }
+        io.to(serverId).emit('user-game-updated', { username: uName, game: cleanGame });
+    });
+
     socket.on('join-text-room', (roomId) => {
         if (!roomId) return;
         const roomKey = serverId + '_' + roomId;
@@ -746,6 +769,31 @@ io.on('connection', async (socket) => {
             callback(clientTimestamp);
         } else {
             socket.emit('pong-check', clientTimestamp);
+        }
+    });
+
+    socket.on('whisper-start', ({ targets, senderName }) => {
+        const uName = senderName || username;
+        for (const roomKey in rooms) {
+            if (rooms[roomKey][socket.id]) {
+                for (const targetSockId in rooms[roomKey]) {
+                    const targetUser = rooms[roomKey][targetSockId];
+                    if (targetUser && Array.isArray(targets) && targets.includes(targetUser.name)) {
+                        io.to(targetSockId).emit('whisper-start', { senderName: uName, senderSocketId: socket.id });
+                    }
+                }
+            }
+        }
+    });
+
+    socket.on('whisper-stop', ({ senderName }) => {
+        const uName = senderName || username;
+        for (const roomKey in rooms) {
+            if (rooms[roomKey][socket.id]) {
+                for (const targetSockId in rooms[roomKey]) {
+                    io.to(targetSockId).emit('whisper-stop', { senderName: uName, senderSocketId: socket.id });
+                }
+            }
         }
     });
 
