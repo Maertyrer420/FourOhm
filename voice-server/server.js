@@ -117,27 +117,52 @@ app.post(['/api/settings', '/api/server/settings'], async (req, res) => {
 });
 
 // Channels
-function sanitizeChannels(channels) {
+function sanitizeChannels(channels, userPower = 100) {
     if (!Array.isArray(channels)) return [];
-    return channels.map(c => {
-        const copy = { ...c };
-        copy.hasPassword = !!copy.password;
-        copy.userLimit = c.userLimit ? Number(c.userLimit) : 0;
-        copy.isHub = !!c.isHub;
-        copy.isTemp = !!c.isTemp;
-        delete copy.password;
-        return copy;
-    });
+    return channels
+        .filter(c => {
+            const req = c.minPower ? Number(c.minPower) : 0;
+            return userPower >= req;
+        })
+        .map(c => {
+            const copy = { ...c };
+            copy.hasPassword = !!copy.password;
+            copy.userLimit = c.userLimit ? Number(c.userLimit) : 0;
+            copy.isHub = !!c.isHub;
+            copy.isTemp = !!c.isTemp;
+            copy.isAfkChannel = !!c.isAfkChannel;
+            copy.minPower = c.minPower ? Number(c.minPower) : 0;
+            delete copy.password;
+            return copy;
+        });
+}
+
+async function broadcastChannelsUpdate(sId) {
+    try {
+        const srv = await db.getVirtualServer(sId);
+        const sockets = await io.in(sId).fetchSockets();
+        for (const s of sockets) {
+            const u = s.handshake.query.username;
+            const role = (u && srv.userGroups && srv.userGroups[u]) || srv.settings?.defaultRole || 'user';
+            const pwr = u ? (powerMap[role] || 0) : 5;
+            s.emit('channels-update', sanitizeChannels(srv.channels || [], pwr));
+        }
+    } catch(e) {
+        console.warn('Error broadcasting channels update:', e.message);
+    }
 }
 
 app.get('/api/channels', async (req, res) => {
     const srvId = req.query.serverId || 'default';
+    const username = req.query.username;
     const srv = await db.getVirtualServer(srvId);
-    res.json(sanitizeChannels(srv.channels || []));
+    const reqRole = (username && srv.userGroups && srv.userGroups[username]) || srv.settings?.defaultRole || 'user';
+    const reqPower = username ? (powerMap[reqRole] || 0) : 100;
+    res.json(sanitizeChannels(srv.channels || [], reqPower));
 });
 
 app.post('/api/channels', async (req, res) => {
-    const { name, type, password, userLimit, isHub } = req.body;
+    const { name, type, password, userLimit, isHub, isAfkChannel, minPower } = req.body;
     if (!name) return res.status(400).json({ error: 'Name is required' });
     const srvId = req.query.serverId || req.body.serverId || 'default';
     const srv = await db.getVirtualServer(srvId);
@@ -151,14 +176,15 @@ app.post('/api/channels', async (req, res) => {
         hasPassword: !!password,
         userLimit: userLimit ? Math.max(0, parseInt(userLimit, 10)) : 0,
         isHub: !!isHub,
+        isAfkChannel: !!isAfkChannel,
+        minPower: minPower ? Number(minPower) : 0,
         whitelist: []
     };
     srv.channels.push(newChannel);
     await db.saveVirtualServer(srvId, srv);
 
-    const safe = sanitizeChannels(srv.channels);
-    io.to(srvId).emit('channels-update', safe);
-    res.json({ success: true, channel: { ...newChannel, password: undefined }, channels: safe });
+    await broadcastChannelsUpdate(srvId);
+    res.json({ success: true, channel: { ...newChannel, password: undefined }, channels: sanitizeChannels(srv.channels, 100) });
 });
 
 app.post('/api/channels/rename', async (req, res) => {
@@ -178,10 +204,9 @@ app.post('/api/channels/rename', async (req, res) => {
         ch.name = newName;
         await db.saveVirtualServer(srvId, srv);
         await db.renameChannelMessages(srvId, oldName, newName);
-        const safe = sanitizeChannels(srv.channels);
-        io.to(srvId).emit('channels-update', safe);
+        await broadcastChannelsUpdate(srvId);
         io.to(srvId).emit('channel-renamed', { oldName, newName, channelId: ch.id });
-        res.json({ success: true, channels: safe });
+        res.json({ success: true, channels: sanitizeChannels(srv.channels, reqPower) });
     } catch(e) {
         res.status(500).json({ error: e.message });
     }
@@ -231,8 +256,7 @@ app.post('/api/channels/whitelist', async (req, res) => {
         if (!ch) return res.status(404).json({ error: 'Kanal nicht gefunden' });
         ch.whitelist = Array.isArray(whitelist) ? whitelist : [];
         await db.saveVirtualServer(srvId, srv);
-        const safe = sanitizeChannels(srv.channels);
-        io.to(srvId).emit('channels-update', safe);
+        await broadcastChannelsUpdate(srvId);
         res.json({ success: true, channel: ch });
     } catch(e) {
         res.status(500).json({ error: e.message });
@@ -244,15 +268,14 @@ app.delete('/api/channels/:name', async (req, res) => {
     const username = req.query.username;
     const srv = await db.getVirtualServer(srvId);
 
-    const reqRole = srv.userGroups[username] || srv.settings?.defaultRole || 'user';
+    const reqRole = (srv.userGroups && srv.userGroups[username]) || srv.settings?.defaultRole || 'user';
     const reqPower = powerMap[reqRole] || 0;
 
     if (reqPower >= 75 || !username) {
         srv.channels = (srv.channels || []).filter(c => c.name !== req.params.name);
         await db.saveVirtualServer(srvId, srv);
-        const safe = sanitizeChannels(srv.channels);
-        io.to(srvId).emit('channels-update', safe);
-        return res.json({ success: true, channels: safe });
+        await broadcastChannelsUpdate(srvId);
+        return res.json({ success: true, channels: sanitizeChannels(srv.channels, reqPower) });
     }
     return res.status(403).json({ error: 'Insufficient power' });
 });
@@ -280,9 +303,8 @@ app.post('/api/channels/reorder', async (req, res) => {
                 };
             });
             await db.saveVirtualServer(srvId, srv);
-            const safe = sanitizeChannels(srv.channels);
-            io.to(srvId).emit('channels-update', safe);
-            return res.json({ success: true, channels: safe });
+            await broadcastChannelsUpdate(srvId);
+            return res.json({ success: true, channels: sanitizeChannels(srv.channels, reqPower) });
         }
         res.status(403).json({ error: 'Unzureichende Berechtigung zum Umordnen' });
     } catch (e) {
@@ -342,9 +364,31 @@ app.delete('/api/emotes/:name', async (req, res) => {
     }
 });
 
-// Messages
+// Messages & Pinned Messages
+app.get('/api/messages/pinned', async (req, res) => {
+    try {
+        const srvId = req.query.serverId || 'default';
+        const roomId = req.query.roomId;
+        if (!roomId) return res.status(400).json({ error: 'roomId required' });
+        const pins = await db.getPinnedMessages(srvId, roomId);
+        res.json(pins);
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 app.get('/api/messages/:room', async (req, res) => {
     const srvId = req.query.serverId || 'default';
+    const username = req.query.username;
+    const srv = await db.getVirtualServer(srvId);
+    const ch = (srv.channels || []).find(c => c.name === req.params.room || c.id === req.params.room);
+    if (ch && ch.minPower) {
+        const role = (username && srv.userGroups && srv.userGroups[username]) || srv.settings?.defaultRole || 'user';
+        const pwr = username ? (powerMap[role] || 0) : 0;
+        if (pwr < ch.minPower) {
+            return res.status(403).json({ error: 'Keine Berechtigung' });
+        }
+    }
     const msgs = await db.getMessages(srvId, req.params.room);
     res.json(msgs);
 });
@@ -528,8 +572,11 @@ io.on('connection', async (socket) => {
         }
     }
 
+    const myRole = (username && srv.userGroups && srv.userGroups[username]) || srv.settings?.defaultRole || 'user';
+    const myPower = username ? (powerMap[myRole] || 0) : 5;
+
     socket.emit('group-update', srv.userGroups || {});
-    socket.emit('channels-update', sanitizeChannels(srv.channels || []));
+    socket.emit('channels-update', sanitizeChannels(srv.channels || [], myPower));
     socket.emit('emotes-update', srv.emotes || []);
     socket.emit('server-info-updated', {
         serverId,
@@ -546,7 +593,7 @@ io.on('connection', async (socket) => {
                 if (idx > -1) {
                     srv.channels.splice(idx, 1);
                     await db.saveVirtualServer(sId, srv);
-                    io.to(sId).emit('channels-update', sanitizeChannels(srv.channels));
+                    await broadcastChannelsUpdate(sId);
                 }
             }
         }
@@ -576,7 +623,7 @@ io.on('connection', async (socket) => {
             };
             srvData.channels.push(tempChannel);
             await db.saveVirtualServer(serverId, srvData);
-            io.to(serverId).emit('channels-update', sanitizeChannels(srvData.channels));
+            await broadcastChannelsUpdate(serverId);
             socket.emit('redirect-to-room', { newRoomId: tempName, newRoomName: tempName });
             return;
         }
@@ -593,13 +640,16 @@ io.on('connection', async (socket) => {
         socket.join(roomKey);
         if (!rooms[roomKey]) rooms[roomKey] = {};
 
+        const isAfkCh = ch && (ch.isAfkChannel || (ch.name && ch.name.toLowerCase().includes('afk')));
         const member = {
             socketId: socket.id,
             peerId,
             name: uName,
             groupId: role,
             currentGame: (userObj && userObj.currentGame) ? String(userObj.currentGame).trim().slice(0, 60) : null,
-            ...(typeof userObj === 'object' ? userObj : {})
+            ...(typeof userObj === 'object' ? userObj : {}),
+            isMuted: isAfkCh ? true : !!(userObj && userObj.isMuted),
+            isAfk: isAfkCh ? true : !!(userObj && userObj.isAfk)
         };
         rooms[roomKey][socket.id] = member;
 
@@ -661,10 +711,13 @@ io.on('connection', async (socket) => {
         const uName = explicitUser || username;
         for (const roomKey in rooms) {
             if (rooms[roomKey][socket.id]) {
-                rooms[roomKey][socket.id].isMuted = !!isMuted;
-                rooms[roomKey][socket.id].isDeafened = !!isDeafened;
                 const [sid, ...parts] = roomKey.split('_');
                 const rId = parts.join('_');
+                const srvChannels = srv.channels || [];
+                const ch = srvChannels.find(c => c.name === rId || c.id === rId);
+                const isAfkRoom = ch && (ch.isAfkChannel || (ch.name && ch.name.toLowerCase().includes('afk')));
+                rooms[roomKey][socket.id].isMuted = isAfkRoom ? true : !!isMuted;
+                rooms[roomKey][socket.id].isDeafened = !!isDeafened;
                 io.to(sid).emit('room-users-update', rId, Object.values(rooms[roomKey]));
             }
         }
@@ -705,28 +758,177 @@ io.on('connection', async (socket) => {
         io.to(serverId).emit('user-game-updated', { username: uName, game: cleanGame });
     });
 
-    socket.on('join-text-room', (roomId) => {
+    socket.on('join-text-room', async (roomId) => {
         if (!roomId) return;
+        const srvData = await db.getVirtualServer(serverId);
+        const ch = (srvData.channels || []).find(c => c.name === roomId || c.id === roomId);
+        const role = (srvData.userGroups && srvData.userGroups[username]) || srvData.settings?.defaultRole || 'user';
+        const reqPower = powerMap[role] || 0;
+        if (ch && ch.minPower && reqPower < ch.minPower) {
+            return; // Not permitted to join restricted text room
+        }
         const roomKey = serverId + '_' + roomId;
         socket.join(roomKey);
     });
 
     socket.on('chat-message', async (roomId, msg, name, isMedia) => {
+        if (!roomId || !msg) return;
+        const srvData = await db.getVirtualServer(serverId);
+        const sender = name || username || 'Gast';
+        const role = (srvData.userGroups && srvData.userGroups[sender]) || srvData.settings?.defaultRole || 'user';
+        const reqPower = powerMap[role] || 0;
+
+        const ch = (srvData.channels || []).find(c => c.name === roomId || c.id === roomId);
+        if (ch && ch.minPower && reqPower < ch.minPower) {
+            return; // Not permitted to post in this room
+        }
+
+        // Moderation text commands (/kick, /ban, /mute) in moderation / staff rooms or by staff
+        if (typeof msg === 'string' && msg.startsWith('/') && reqPower >= 50) {
+            const parts = msg.trim().split(/\s+/);
+            const cmd = parts[0].toLowerCase();
+            const targetUser = parts[1];
+
+            if (cmd === '/kick' && targetUser) {
+                io.to(serverId).emit('user-kicked', targetUser);
+                const auditMsg = {
+                    id: 'audit_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
+                    senderName: '🛡️ SYSTEM-AUDIT',
+                    msg: `Moderator **${sender}** hat **${targetUser}** per Chat-Befehl gekickt.`,
+                    timestamp: Date.now(),
+                    isMedia: false,
+                    edited: false,
+                    reactions: {}
+                };
+                await db.addMessage(serverId, roomId, auditMsg);
+                io.to(serverId + '_' + roomId).emit('chat-message', 'system', auditMsg.senderName, auditMsg.msg, roomId, auditMsg.timestamp, auditMsg.id, {}, false, null, null, false);
+                return;
+            } else if (cmd === '/ban' && targetUser && reqPower >= 75) {
+                srvData.banned = srvData.banned || [];
+                if (!srvData.banned.includes(targetUser)) srvData.banned.push(targetUser);
+                await db.saveVirtualServer(serverId, srvData);
+                io.to(serverId).emit('user-banned', targetUser);
+                const auditMsg = {
+                    id: 'audit_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
+                    senderName: '🛡️ SYSTEM-AUDIT',
+                    msg: `Administrator **${sender}** hat **${targetUser}** per Chat-Befehl dauerhaft gebannt.`,
+                    timestamp: Date.now(),
+                    isMedia: false,
+                    edited: false,
+                    reactions: {}
+                };
+                await db.addMessage(serverId, roomId, auditMsg);
+                io.to(serverId + '_' + roomId).emit('chat-message', 'system', auditMsg.senderName, auditMsg.msg, roomId, auditMsg.timestamp, auditMsg.id, {}, false, null, null, false);
+                return;
+            } else if (cmd === '/mute' && targetUser) {
+                srvData.serverMuted = srvData.serverMuted || [];
+                if (!srvData.serverMuted.includes(targetUser)) srvData.serverMuted.push(targetUser);
+                await db.saveVirtualServer(serverId, srvData);
+                io.to(serverId).emit('user-server-muted', targetUser);
+                const auditMsg = {
+                    id: 'audit_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
+                    senderName: '🛡️ SYSTEM-AUDIT',
+                    msg: `Moderator **${sender}** hat **${targetUser}** per Chat-Befehl stummgeschaltet.`,
+                    timestamp: Date.now(),
+                    isMedia: false,
+                    edited: false,
+                    reactions: {}
+                };
+                await db.addMessage(serverId, roomId, auditMsg);
+                io.to(serverId + '_' + roomId).emit('chat-message', 'system', auditMsg.senderName, auditMsg.msg, roomId, auditMsg.timestamp, auditMsg.id, {}, false, null, null, false);
+                return;
+            }
+        }
+
         const msgObj = {
             id: 'msg_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
-            senderName: name,
+            senderName: sender,
             msg,
             timestamp: Date.now(),
             isMedia: !!isMedia,
             edited: false,
             reactions: {}
         };
+
+        // Mini Games & Tools (/roll, /flip, /poll)
+        if (typeof msg === 'string' && !isMedia) {
+            const trimmed = msg.trim();
+            if (/^\/roll(\s+\d+)?$/i.test(trimmed)) {
+                const match = trimmed.match(/^\/roll(?:\s+(\d+))?/i);
+                const max = match && match[1] ? Math.max(2, parseInt(match[1], 10)) : 100;
+                const result = Math.floor(Math.random() * max) + 1;
+                msgObj.game = { type: 'roll', max, result, user: sender };
+                msgObj.msg = `🎲 **${sender}** würfelt eine **${result}** (1-${max})`;
+            } else if (/^\/flip$/i.test(trimmed)) {
+                const result = Math.random() < 0.5 ? 'Kopf' : 'Zahl';
+                msgObj.game = { type: 'flip', result, user: sender };
+                msgObj.msg = `🪙 **${sender}** wirft eine Münze: **${result}**!`;
+            } else if (/^\/poll\s+/i.test(trimmed)) {
+                const raw = trimmed.replace(/^\/poll\s+/i, '');
+                let question = '';
+                let optsPart = '';
+                if (raw.includes('?') && raw.indexOf('?') < raw.indexOf('|')) {
+                    const qIdx = raw.indexOf('?');
+                    question = raw.slice(0, qIdx + 1).trim();
+                    optsPart = raw.slice(qIdx + 1).trim();
+                } else if (raw.includes('|')) {
+                    const firstPipe = raw.indexOf('|');
+                    question = raw.slice(0, firstPipe).trim();
+                    optsPart = raw.slice(firstPipe + 1).trim();
+                }
+                const options = optsPart.split('|').map(s => s.trim()).filter(s => s.length > 0);
+                if (question && options.length >= 2) {
+                    msgObj.poll = {
+                        question: question,
+                        options: options.map(o => ({ text: o, votes: [] })),
+                        creator: sender
+                    };
+                    msgObj.msg = `📊 **Umfrage:** ${question}`;
+                }
+            }
+        }
+
         const saved = await db.addMessage(serverId, roomId, msgObj);
         const finalId = (saved && saved.id) || msgObj.id;
 
         const roomKey = serverId + '_' + roomId;
-        io.to(roomKey).emit('chat-message', socket.id, name, msg, roomId, msgObj.timestamp, finalId, {}, false);
-        io.to(serverId).emit('chat-message', socket.id, name, msg, roomId, msgObj.timestamp, finalId, {}, false);
+        const isRestricted = ch && ch.minPower && ch.minPower > 0;
+
+        io.to(roomKey).emit('chat-message', socket.id, sender, msgObj.msg, roomId, msgObj.timestamp, finalId, msgObj.reactions, false, msgObj.poll || null, msgObj.game || null, msgObj.isPinned || false);
+        if (!isRestricted) {
+            io.to(serverId).emit('chat-message', socket.id, sender, msgObj.msg, roomId, msgObj.timestamp, finalId, msgObj.reactions, false, msgObj.poll || null, msgObj.game || null, msgObj.isPinned || false);
+        }
+    });
+
+    socket.on('pin-message', async ({ roomId, messageId, isPinned, requestingUser }) => {
+        const uName = requestingUser || username;
+        const srvData = await db.getVirtualServer(serverId);
+        const role = (srvData.userGroups && srvData.userGroups[uName]) || srvData.settings?.defaultRole || 'user';
+        const reqPower = powerMap[role] || 0;
+        if (reqPower < 50) return; // Only supporters, admins, owner can pin
+        const pinnedList = await db.pinMessage(serverId, roomId, messageId, isPinned);
+        io.to(serverId + '_' + roomId).emit('pinned-messages-updated', { roomId, pinnedMessages: pinnedList });
+        io.to(serverId).emit('pinned-messages-updated', { roomId, pinnedMessages: pinnedList });
+    });
+
+    socket.on('get-pinned-messages', async ({ roomId }, callback) => {
+        if (!roomId) return;
+        const pinnedList = await db.getPinnedMessages(serverId, roomId);
+        if (typeof callback === 'function') {
+            callback(pinnedList);
+        } else {
+            socket.emit('pinned-messages-updated', { roomId, pinnedMessages: pinnedList });
+        }
+    });
+
+    socket.on('poll-vote', async ({ roomId, messageId, optionIndex, username: voter }) => {
+        const uName = voter || username;
+        if (!roomId || !messageId || optionIndex === undefined || !uName) return;
+        const updatedPoll = await db.votePoll(serverId, roomId, messageId, optionIndex, uName);
+        if (updatedPoll) {
+            io.to(serverId + '_' + roomId).emit('poll-updated', { roomId, messageId, poll: updatedPoll });
+            io.to(serverId).emit('poll-updated', { roomId, messageId, poll: updatedPoll });
+        }
     });
 
     socket.on('edit-message', async ({ roomId, messageId, newText }) => {

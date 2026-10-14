@@ -390,8 +390,10 @@ module.exports = {
                     id: serverId,
                     channels: [
                         { id: 'lobby', name: 'Lobby', type: 'text' },
+                        { id: 'moderation-text', name: 'moderation', type: 'text', minPower: 50 },
                         { id: 'general-voice', name: 'General', type: 'voice' },
-                        { id: 'gaming-voice', name: 'Gaming', type: 'voice' }
+                        { id: 'gaming-voice', name: 'Gaming', type: 'voice' },
+                        { id: 'afk-voice', name: '💤 AFK', type: 'voice', isAfkChannel: true }
                     ],
                     groups: {
                         'owner': { name: 'Owner', power: 100 },
@@ -403,8 +405,22 @@ module.exports = {
                     },
                     userGroups: {},
                     settings: { welcomeMessage: 'Willkommen auf dem Server!', defaultRole: 'user' },
-                    banned: []
+                    banned: [],
+                    pinnedMessages: {}
                 };
+            } else {
+                if (!Array.isArray(data.channels)) data.channels = [];
+                if (!data.pinnedMessages) data.pinnedMessages = {};
+                // Ensure AFK channel exists
+                if (!data.channels.some(c => c.isAfkChannel || c.id === 'afk-voice' || (c.name && c.name.toLowerCase().includes('afk')))) {
+                    data.channels.push({ id: 'afk-voice', name: '💤 AFK', type: 'voice', isAfkChannel: true });
+                    isNew = true;
+                }
+                // Ensure Moderation text channel exists
+                if (!data.channels.some(c => c.minPower >= 50 || c.id === 'moderation-text' || c.name === 'moderation')) {
+                    data.channels.push({ id: 'moderation-text', name: 'moderation', type: 'text', minPower: 50 });
+                    isNew = true;
+                }
             }
             // Migrate legacy inline messages into the messages store
             if (pgPool && data.messages) {
@@ -630,6 +646,84 @@ module.exports = {
                 await module.exports.saveVirtualServer(serverId, srv);
             }
         }
+    },
+
+    pinMessage: async (serverId, room, messageId, isPinned) => {
+        serverId = serverId || 'default';
+        const srv = await module.exports.getVirtualServer(serverId);
+        if (!srv.pinnedMessages) srv.pinnedMessages = {};
+        if (!srv.pinnedMessages[room]) srv.pinnedMessages[room] = [];
+
+        if (isPinned) {
+            let msg = null;
+            if (srv.messages && srv.messages[room]) {
+                msg = srv.messages[room].find(m => String(m.id) === String(messageId) || String(m.timestamp) === String(messageId));
+            }
+            if (!msg) {
+                const msgs = await module.exports.getMessages(serverId, room);
+                msg = msgs.find(m => String(m.id) === String(messageId) || String(m.timestamp) === String(messageId));
+            }
+            if (msg) {
+                msg.isPinned = true;
+                const existingIdx = srv.pinnedMessages[room].findIndex(m => String(m.id) === String(messageId) || String(m.timestamp) === String(messageId));
+                if (existingIdx > -1) {
+                    srv.pinnedMessages[room][existingIdx] = { ...msg, isPinned: true };
+                } else {
+                    srv.pinnedMessages[room].unshift({ ...msg, isPinned: true });
+                }
+            }
+        } else {
+            srv.pinnedMessages[room] = srv.pinnedMessages[room].filter(m => String(m.id) !== String(messageId) && String(m.timestamp) !== String(messageId));
+            if (srv.messages && srv.messages[room]) {
+                const m = srv.messages[room].find(x => String(x.id) === String(messageId) || String(x.timestamp) === String(messageId));
+                if (m) m.isPinned = false;
+            }
+        }
+        await module.exports.saveVirtualServer(serverId, srv);
+        return srv.pinnedMessages[room];
+    },
+
+    getPinnedMessages: async (serverId, room) => {
+        serverId = serverId || 'default';
+        const srv = await module.exports.getVirtualServer(serverId);
+        return (srv.pinnedMessages && srv.pinnedMessages[room]) || [];
+    },
+
+    votePoll: async (serverId, room, messageId, optionIndex, username) => {
+        serverId = serverId || 'default';
+        if (!username || optionIndex === undefined || optionIndex === null) return null;
+        const srv = await module.exports.getVirtualServer(serverId);
+        let msg = null;
+        if (srv.messages && srv.messages[room]) {
+            msg = srv.messages[room].find(m => String(m.id) === String(messageId) || String(m.timestamp) === String(messageId));
+        }
+        if (!msg) {
+            const msgs = await module.exports.getMessages(serverId, room);
+            msg = msgs.find(m => String(m.id) === String(messageId) || String(m.timestamp) === String(messageId));
+        }
+        if (msg && msg.poll && Array.isArray(msg.poll.options) && msg.poll.options[optionIndex]) {
+            let wasSelected = false;
+            msg.poll.options.forEach((opt, idx) => {
+                if (!Array.isArray(opt.votes)) opt.votes = [];
+                const uIdx = opt.votes.indexOf(username);
+                if (uIdx > -1) {
+                    opt.votes.splice(uIdx, 1);
+                    if (idx === optionIndex) wasSelected = true;
+                }
+            });
+            if (!wasSelected) {
+                msg.poll.options[optionIndex].votes.push(username);
+            }
+            if (srv.pinnedMessages && srv.pinnedMessages[room]) {
+                const pIdx = srv.pinnedMessages[room].findIndex(m => String(m.id) === String(messageId) || String(m.timestamp) === String(messageId));
+                if (pIdx > -1) {
+                    srv.pinnedMessages[room][pIdx] = { ...msg };
+                }
+            }
+            await module.exports.saveVirtualServer(serverId, srv);
+            return msg.poll;
+        }
+        return null;
     },
 
     cleanupMedia: async () => {
