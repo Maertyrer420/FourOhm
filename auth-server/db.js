@@ -89,6 +89,11 @@ async function initPgTables() {
                 ts BIGINT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_messages_room ON messages (server_id, room, ts);
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited BOOLEAN DEFAULT false;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS reactions JSONB DEFAULT '{}'::jsonb;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS poll JSONB DEFAULT NULL;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS game JSONB DEFAULT NULL;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_pinned BOOLEAN DEFAULT false;
 
             CREATE TABLE IF NOT EXISTS direct_messages (
                 id SERIAL PRIMARY KEY,
@@ -885,8 +890,10 @@ module.exports = {
                     id: serverId,
                     channels: [
                         { id: 'lobby', name: 'Lobby', type: 'text' },
+                        { id: 'moderation-text', name: 'moderation', type: 'text', minPower: 50 },
                         { id: 'general-voice', name: 'General', type: 'voice' },
-                        { id: 'gaming-voice', name: 'Gaming', type: 'voice' }
+                        { id: 'gaming-voice', name: 'Gaming', type: 'voice' },
+                        { id: 'afk-voice', name: '💤 AFK', type: 'voice', isAfkChannel: true }
                     ],
                     groups: {
                         'owner': { name: 'Owner', power: 100 },
@@ -898,8 +905,22 @@ module.exports = {
                     },
                     userGroups: {},
                     settings: { welcomeMessage: 'Willkommen auf dem Server!', defaultRole: 'user' },
-                    banned: []
+                    banned: [],
+                    pinnedMessages: {}
                 };
+            } else {
+                if (!Array.isArray(data.channels)) data.channels = [];
+                if (!data.pinnedMessages) data.pinnedMessages = {};
+                // Ensure AFK channel exists
+                if (!data.channels.some(c => c.isAfkChannel || c.id === 'afk-voice' || (c.name && c.name.toLowerCase().includes('afk')))) {
+                    data.channels.push({ id: 'afk-voice', name: '💤 AFK', type: 'voice', isAfkChannel: true });
+                    isNew = true;
+                }
+                // Ensure Moderation text channel exists
+                if (!data.channels.some(c => (c.minPower && c.minPower >= 50) || c.id === 'moderation-text' || c.name === 'moderation')) {
+                    data.channels.push({ id: 'moderation-text', name: 'moderation', type: 'text', minPower: 50 });
+                    isNew = true;
+                }
             }
             // Migrate legacy inline messages into the messages store
             if (pgPool && data.messages) {
@@ -940,9 +961,47 @@ module.exports = {
     // --- Chat Messages ---
     addMessage: async (serverId, room, msgObj) => {
         serverId = serverId || 'default';
+        if (!msgObj.id) {
+            msgObj.id = 'msg_' + (msgObj.timestamp || Date.now()) + '_' + Math.random().toString(36).substr(2, 6);
+        }
         if (pgPool) {
-            await pgPool.query('INSERT INTO messages (server_id, room, sender, msg, is_media, ts) VALUES ($1,$2,$3,$4,$5,$6)',
-                [serverId, room, msgObj.senderName, msgObj.msg, !!msgObj.isMedia, msgObj.timestamp]);
+            try {
+                const res = await pgPool.query(
+                    'INSERT INTO messages (server_id, room, sender, msg, is_media, ts, edited, reactions, poll, game, is_pinned) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id',
+                    [
+                        serverId,
+                        room,
+                        msgObj.senderName,
+                        msgObj.msg,
+                        !!msgObj.isMedia,
+                        msgObj.timestamp || Date.now(),
+                        !!msgObj.edited,
+                        JSON.stringify(msgObj.reactions || {}),
+                        msgObj.poll ? JSON.stringify(msgObj.poll) : null,
+                        msgObj.game ? JSON.stringify(msgObj.game) : null,
+                        !!msgObj.isPinned
+                    ]
+                );
+                if (res.rows && res.rows[0]) {
+                    msgObj.id = String(res.rows[0].id);
+                }
+            } catch (e) {
+                try {
+                    const res = await pgPool.query(
+                        'INSERT INTO messages (server_id, room, sender, msg, is_media, ts, edited, reactions) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id',
+                        [serverId, room, msgObj.senderName, msgObj.msg, !!msgObj.isMedia, msgObj.timestamp || Date.now(), !!msgObj.edited, JSON.stringify(msgObj.reactions || {})]
+                    );
+                    if (res.rows && res.rows[0]) msgObj.id = String(res.rows[0].id);
+                } catch (e2) {
+                    const fallbackRes = await pgPool.query(
+                        'INSERT INTO messages (server_id, room, sender, msg, is_media, ts) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id',
+                        [serverId, room, msgObj.senderName, msgObj.msg, !!msgObj.isMedia, msgObj.timestamp || Date.now()]
+                    );
+                    if (fallbackRes.rows && fallbackRes.rows[0]) {
+                        msgObj.id = String(fallbackRes.rows[0].id);
+                    }
+                }
+            }
         } else {
             const srv = await module.exports.getVirtualServer(serverId);
             if (!srv.messages) srv.messages = {};
@@ -951,18 +1010,278 @@ module.exports = {
             if (srv.messages[room].length > MAX_HISTORY) srv.messages[room] = srv.messages[room].slice(-MAX_HISTORY);
             await module.exports.saveVirtualServer(serverId, srv);
         }
+        return msgObj;
     },
 
     getMessages: async (serverId, room) => {
         serverId = serverId || 'default';
         if (pgPool) {
-            const res = await pgPool.query(
-                'SELECT sender, msg, is_media, ts FROM (SELECT * FROM messages WHERE server_id = $1 AND room = $2 ORDER BY ts DESC LIMIT $3) t ORDER BY ts ASC',
-                [serverId, room, MAX_HISTORY]);
-            return res.rows.map(r => ({ senderName: r.sender, msg: r.msg, isMedia: r.is_media, timestamp: Number(r.ts) }));
+            try {
+                const res = await pgPool.query(
+                    'SELECT id, sender, msg, is_media, ts, edited, reactions, poll, game, is_pinned FROM (SELECT * FROM messages WHERE server_id = $1 AND room = $2 ORDER BY ts DESC LIMIT $3) t ORDER BY ts ASC',
+                    [serverId, room, MAX_HISTORY]);
+                return res.rows.map(r => {
+                    let reacs = {};
+                    if (r.reactions) {
+                        try { reacs = typeof r.reactions === 'string' ? JSON.parse(r.reactions) : r.reactions; } catch (e) { reacs = {}; }
+                    }
+                    let poll = null;
+                    if (r.poll) {
+                        try { poll = typeof r.poll === 'string' ? JSON.parse(r.poll) : r.poll; } catch (e) { poll = null; }
+                    }
+                    let game = null;
+                    if (r.game) {
+                        try { game = typeof r.game === 'string' ? JSON.parse(r.game) : r.game; } catch (e) { game = null; }
+                    }
+                    return {
+                        id: String(r.id),
+                        senderName: r.sender,
+                        msg: r.msg,
+                        isMedia: r.is_media,
+                        timestamp: Number(r.ts),
+                        edited: !!r.edited,
+                        reactions: reacs || {},
+                        poll: poll,
+                        game: game,
+                        isPinned: !!r.is_pinned
+                    };
+                });
+            } catch (e) {
+                try {
+                    const res = await pgPool.query(
+                        'SELECT id, sender, msg, is_media, ts, edited, reactions FROM (SELECT * FROM messages WHERE server_id = $1 AND room = $2 ORDER BY ts DESC LIMIT $3) t ORDER BY ts ASC',
+                        [serverId, room, MAX_HISTORY]);
+                    return res.rows.map(r => {
+                        let reacs = {};
+                        if (r.reactions) {
+                            try { reacs = typeof r.reactions === 'string' ? JSON.parse(r.reactions) : r.reactions; } catch (e) { reacs = {}; }
+                        }
+                        return {
+                            id: String(r.id),
+                            senderName: r.sender,
+                            msg: r.msg,
+                            isMedia: r.is_media,
+                            timestamp: Number(r.ts),
+                            edited: !!r.edited,
+                            reactions: reacs || {}
+                        };
+                    });
+                } catch (e2) {
+                    const res = await pgPool.query(
+                        'SELECT id, sender, msg, is_media, ts FROM (SELECT * FROM messages WHERE server_id = $1 AND room = $2 ORDER BY ts DESC LIMIT $3) t ORDER BY ts ASC',
+                        [serverId, room, MAX_HISTORY]);
+                    return res.rows.map(r => ({
+                        id: String(r.id),
+                        senderName: r.sender,
+                        msg: r.msg,
+                        isMedia: r.is_media,
+                        timestamp: Number(r.ts),
+                        edited: false,
+                        reactions: {}
+                    }));
+                }
+            }
         }
         const srv = await module.exports.getVirtualServer(serverId);
         return (srv.messages && srv.messages[room]) || [];
+    },
+
+    editMessage: async (serverId, room, messageId, newText) => {
+        serverId = serverId || 'default';
+        if (pgPool) {
+            const numId = parseInt(messageId, 10);
+            if (!isNaN(numId)) {
+                await pgPool.query('UPDATE messages SET msg = $1, edited = true WHERE server_id = $2 AND room = $3 AND id = $4', [newText, serverId, room, numId]);
+            } else {
+                await pgPool.query('UPDATE messages SET msg = $1, edited = true WHERE server_id = $2 AND room = $3 AND ts = $4', [newText, serverId, room, Number(messageId)]);
+            }
+        } else {
+            const srv = await module.exports.getVirtualServer(serverId);
+            if (srv.messages && srv.messages[room]) {
+                const m = srv.messages[room].find(x => String(x.id) === String(messageId) || String(x.timestamp) === String(messageId));
+                if (m) {
+                    m.msg = newText;
+                    m.edited = true;
+                    await module.exports.saveVirtualServer(serverId, srv);
+                }
+            }
+        }
+    },
+
+    deleteMessage: async (serverId, room, messageId) => {
+        serverId = serverId || 'default';
+        if (pgPool) {
+            const numId = parseInt(messageId, 10);
+            if (!isNaN(numId)) {
+                await pgPool.query('DELETE FROM messages WHERE server_id = $1 AND room = $2 AND id = $3', [serverId, room, numId]);
+            } else {
+                await pgPool.query('DELETE FROM messages WHERE server_id = $1 AND room = $2 AND ts = $3', [serverId, room, Number(messageId)]);
+            }
+        } else {
+            const srv = await module.exports.getVirtualServer(serverId);
+            if (srv.messages && srv.messages[room]) {
+                srv.messages[room] = srv.messages[room].filter(x => String(x.id) !== String(messageId) && String(x.timestamp) !== String(messageId));
+                await module.exports.saveVirtualServer(serverId, srv);
+            }
+        }
+    },
+
+    updateReaction: async (serverId, room, messageId, emoji, username) => {
+        serverId = serverId || 'default';
+        let updatedReactions = {};
+        if (pgPool) {
+            try {
+                const numId = parseInt(messageId, 10);
+                const query = !isNaN(numId) 
+                    ? 'SELECT reactions FROM messages WHERE server_id = $1 AND room = $2 AND id = $3'
+                    : 'SELECT reactions FROM messages WHERE server_id = $1 AND room = $2 AND ts = $3';
+                const param = !isNaN(numId) ? numId : Number(messageId);
+                const res = await pgPool.query(query, [serverId, room, param]);
+                if (res.rows && res.rows[0]) {
+                    let r = res.rows[0].reactions;
+                    if (typeof r === 'string') {
+                        try { r = JSON.parse(r); } catch (e) { r = {}; }
+                    }
+                    r = r || {};
+                    if (!r[emoji]) r[emoji] = [];
+                    const idx = r[emoji].indexOf(username);
+                    if (idx > -1) {
+                        r[emoji].splice(idx, 1);
+                        if (r[emoji].length === 0) delete r[emoji];
+                    } else {
+                        r[emoji].push(username);
+                    }
+                    updatedReactions = r;
+                    const updateQ = !isNaN(numId)
+                        ? 'UPDATE messages SET reactions = $1 WHERE server_id = $2 AND room = $3 AND id = $4'
+                        : 'UPDATE messages SET reactions = $1 WHERE server_id = $2 AND room = $3 AND ts = $4';
+                    await pgPool.query(updateQ, [JSON.stringify(r), serverId, room, param]);
+                }
+            } catch (e) {
+                console.warn('[DB] Reaction update error:', e.message);
+            }
+        } else {
+            const srv = await module.exports.getVirtualServer(serverId);
+            if (srv.messages && srv.messages[room]) {
+                const m = srv.messages[room].find(x => String(x.id) === String(messageId) || String(x.timestamp) === String(messageId));
+                if (m) {
+                    if (!m.reactions) m.reactions = {};
+                    if (!m.reactions[emoji]) m.reactions[emoji] = [];
+                    const idx = m.reactions[emoji].indexOf(username);
+                    if (idx > -1) {
+                        m.reactions[emoji].splice(idx, 1);
+                        if (m.reactions[emoji].length === 0) delete m.reactions[emoji];
+                    } else {
+                        m.reactions[emoji].push(username);
+                    }
+                    updatedReactions = m.reactions;
+                    await module.exports.saveVirtualServer(serverId, srv);
+                }
+            }
+        }
+        return updatedReactions;
+    },
+
+    pinMessage: async (serverId, room, messageId, isPinned) => {
+        serverId = serverId || 'default';
+        const srv = await module.exports.getVirtualServer(serverId);
+        if (!srv.pinnedMessages) srv.pinnedMessages = {};
+        if (!srv.pinnedMessages[room]) srv.pinnedMessages[room] = [];
+
+        if (isPinned) {
+            let msg = null;
+            if (srv.messages && srv.messages[room]) {
+                msg = srv.messages[room].find(m => String(m.id) === String(messageId) || String(m.timestamp) === String(messageId));
+            }
+            if (!msg) {
+                const msgs = await module.exports.getMessages(serverId, room);
+                msg = msgs.find(m => String(m.id) === String(messageId) || String(m.timestamp) === String(messageId));
+            }
+            if (msg) {
+                msg.isPinned = true;
+                const existingIdx = srv.pinnedMessages[room].findIndex(m => String(m.id) === String(messageId) || String(m.timestamp) === String(messageId));
+                if (existingIdx > -1) {
+                    srv.pinnedMessages[room][existingIdx] = { ...msg, isPinned: true };
+                } else {
+                    srv.pinnedMessages[room].unshift({ ...msg, isPinned: true });
+                }
+            }
+        } else {
+            srv.pinnedMessages[room] = srv.pinnedMessages[room].filter(m => String(m.id) !== String(messageId) && String(m.timestamp) !== String(messageId));
+            if (srv.messages && srv.messages[room]) {
+                const m = srv.messages[room].find(x => String(x.id) === String(messageId) || String(x.timestamp) === String(messageId));
+                if (m) m.isPinned = false;
+            }
+        }
+        if (pgPool) {
+            try {
+                const numId = parseInt(messageId, 10);
+                if (!isNaN(numId)) {
+                    await pgPool.query('UPDATE messages SET is_pinned = $1 WHERE server_id = $2 AND room = $3 AND id = $4', [!!isPinned, serverId, room, numId]);
+                } else {
+                    await pgPool.query('UPDATE messages SET is_pinned = $1 WHERE server_id = $2 AND room = $3 AND ts = $4', [!!isPinned, serverId, room, Number(messageId)]);
+                }
+            } catch (e) {
+                console.warn('[DB] pinMessage pg update error:', e.message);
+            }
+        }
+        await module.exports.saveVirtualServer(serverId, srv);
+        return srv.pinnedMessages[room];
+    },
+
+    getPinnedMessages: async (serverId, room) => {
+        serverId = serverId || 'default';
+        const srv = await module.exports.getVirtualServer(serverId);
+        return (srv.pinnedMessages && srv.pinnedMessages[room]) || [];
+    },
+
+    votePoll: async (serverId, room, messageId, optionIndex, username) => {
+        serverId = serverId || 'default';
+        if (!username || optionIndex === undefined || optionIndex === null) return null;
+        const srv = await module.exports.getVirtualServer(serverId);
+        let msg = null;
+        if (srv.messages && srv.messages[room]) {
+            msg = srv.messages[room].find(m => String(m.id) === String(messageId) || String(m.timestamp) === String(messageId));
+        }
+        if (!msg) {
+            const msgs = await module.exports.getMessages(serverId, room);
+            msg = msgs.find(m => String(m.id) === String(messageId) || String(m.timestamp) === String(messageId));
+        }
+        if (msg && msg.poll && Array.isArray(msg.poll.options) && msg.poll.options[optionIndex]) {
+            let wasSelected = false;
+            msg.poll.options.forEach((opt, idx) => {
+                if (!Array.isArray(opt.votes)) opt.votes = [];
+                const uIdx = opt.votes.indexOf(username);
+                if (uIdx > -1) {
+                    opt.votes.splice(uIdx, 1);
+                    if (idx === optionIndex) wasSelected = true;
+                }
+            });
+            if (!wasSelected) {
+                msg.poll.options[optionIndex].votes.push(username);
+            }
+            if (srv.pinnedMessages && srv.pinnedMessages[room]) {
+                const pIdx = srv.pinnedMessages[room].findIndex(m => String(m.id) === String(messageId) || String(m.timestamp) === String(messageId));
+                if (pIdx > -1) {
+                    srv.pinnedMessages[room][pIdx] = { ...msg };
+                }
+            }
+            if (pgPool) {
+                try {
+                    const numId = parseInt(messageId, 10);
+                    if (!isNaN(numId)) {
+                        await pgPool.query('UPDATE messages SET poll = $1 WHERE server_id = $2 AND room = $3 AND id = $4', [JSON.stringify(msg.poll), serverId, room, numId]);
+                    } else {
+                        await pgPool.query('UPDATE messages SET poll = $1 WHERE server_id = $2 AND room = $3 AND ts = $4', [JSON.stringify(msg.poll), serverId, room, Number(messageId)]);
+                    }
+                } catch (e) {
+                    console.warn('[DB] votePoll pg update error:', e.message);
+                }
+            }
+            await module.exports.saveVirtualServer(serverId, srv);
+            return msg.poll;
+        }
+        return null;
     },
 
     renameChannelMessages: async (serverId, oldName, newName) => {
